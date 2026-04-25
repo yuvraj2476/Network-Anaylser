@@ -1,0 +1,5 @@
+.ruff_cache/
+network_manager.db
+__pycache__/
+*.pyc
+.env

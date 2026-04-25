@@ -1,0 +1,1454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Manager</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+<style>
+:root {
+  --bg: #0a0e17;
+  --card: #111827;
+  --card2: #1a2332;
+  --border: #1e2d3d;
+  --accent: #00d4ff;
+  --accent2: #00ff88;
+  --red: #ff4757;
+  --orange: #ffa502;
+  --yellow: #ffd700;
+  --purple: #a855f7;
+  --text: #e2e8f0;
+  --dim: #64748b;
+  --radius: 12px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Layout */
+.app { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 260px; background: var(--card); border-right: 1px solid var(--border);
+  padding: 20px; display: flex; flex-direction: column; position: fixed;
+  top: 0; left: 0; bottom: 0; z-index: 50; transition: transform 0.3s;
+}
+.main { flex: 1; margin-left: 260px; padding: 20px; }
+
+/* Sidebar */
+.logo { display: flex; align-items: center; gap: 10px; margin-bottom: 30px; }
+.logo-icon {
+  width: 40px; height: 40px; background: linear-gradient(135deg, var(--accent), var(--accent2));
+  border-radius: 10px; display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+}
+.logo h1 { font-size: 18px; font-weight: 700; }
+.logo span { font-size: 11px; color: var(--dim); display: block; }
+
+.nav-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+  border-radius: 8px; cursor: pointer; transition: all 0.2s;
+  color: var(--dim); font-size: 14px; margin-bottom: 4px; border: none;
+  background: none; width: 100%; text-align: left;
+}
+.nav-item:hover, .nav-item.active { background: var(--card2); color: var(--text); }
+.nav-item.active { border-left: 3px solid var(--accent); }
+.nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+.nav-badge {
+  margin-left: auto; background: var(--red); color: white; font-size: 11px;
+  padding: 2px 7px; border-radius: 10px; font-weight: 700;
+}
+
+.sidebar-footer {
+  margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);
+}
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.status-dot.online { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+.status-dot.offline { background: var(--red); }
+
+/* Header */
+.page-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 24px; flex-wrap: wrap; gap: 12px;
+}
+.page-header h2 { font-size: 24px; font-weight: 700; }
+.header-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+/* Buttons */
+.btn {
+  padding: 10px 18px; border: none; border-radius: 8px; cursor: pointer;
+  font-size: 13px; font-weight: 600; transition: all 0.2s; display: inline-flex;
+  align-items: center; gap: 6px;
+}
+.btn-primary { background: var(--accent); color: #000; }
+.btn-primary:hover { background: #00b8e0; }
+.btn-success { background: var(--accent2); color: #000; }
+.btn-danger { background: var(--red); color: white; }
+.btn-outline { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+.btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+.btn-sm { padding: 6px 12px; font-size: 12px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Stats Cards */
+.stats-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px; margin-bottom: 24px;
+}
+.stat-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px; position: relative; overflow: hidden;
+}
+.stat-card::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+}
+.stat-card.blue::before { background: var(--accent); }
+.stat-card.green::before { background: var(--accent2); }
+.stat-card.red::before { background: var(--red); }
+.stat-card.orange::before { background: var(--orange); }
+.stat-card.purple::before { background: var(--purple); }
+.stat-label { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-value { font-size: 32px; font-weight: 800; margin: 6px 0; }
+.stat-sub { font-size: 12px; color: var(--dim); }
+.blue .stat-value { color: var(--accent); }
+.green .stat-value { color: var(--accent2); }
+.red .stat-value { color: var(--red); }
+.orange .stat-value { color: var(--orange); }
+.purple .stat-value { color: var(--purple); }
+
+/* Cards */
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px; margin-bottom: 20px;
+}
+.card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px;
+}
+.card-header h3 { font-size: 16px; font-weight: 600; }
+
+/* Grid layouts */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+
+/* Device List */
+.device-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+}
+.device-card {
+  background: var(--card2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px; transition: all 0.2s; position: relative;
+}
+.device-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.device-card.blocked { border-color: var(--red); opacity: 0.7; }
+.device-top { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.device-icon {
+  width: 44px; height: 44px; border-radius: 10px; display: flex;
+  align-items: center; justify-content: center; font-size: 22px;
+  background: var(--card);
+}
+.device-name { font-size: 15px; font-weight: 600; }
+.device-ip { font-size: 12px; color: var(--dim); font-family: monospace; }
+.device-meta {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px;
+  margin-bottom: 12px;
+}
+.device-meta .label { color: var(--dim); }
+.device-meta .val { color: var(--text); font-family: monospace; font-size: 11px; }
+.device-status {
+  position: absolute; top: 12px; right: 12px;
+  padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
+}
+.device-status.online { background: rgba(0,255,136,0.15); color: var(--accent2); }
+.device-status.offline { background: rgba(255,71,87,0.15); color: var(--red); }
+.device-status.blocked-badge { background: rgba(255,71,87,0.3); color: var(--red); }
+.device-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left; padding: 12px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--dim); border-bottom: 1px solid var(--border);
+}
+td { padding: 12px; font-size: 13px; border-bottom: 1px solid rgba(30,45,61,0.5); }
+tr:hover td { background: rgba(0,212,255,0.03); }
+
+/* Network Map */
+#network-map { height: 400px; border-radius: var(--radius); background: var(--card2); }
+
+/* Charts */
+.chart-container { position: relative; height: 250px; }
+
+/* Alerts */
+.alert-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px;
+  border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.alert-item:last-child { border-bottom: none; }
+.alert-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.alert-dot.new_device { background: var(--orange); }
+.alert-dot.device_blocked { background: var(--red); }
+.alert-dot.default { background: var(--accent); }
+.alert-time { color: var(--dim); font-size: 11px; margin-left: auto; white-space: nowrap; }
+.alert-unread { background: rgba(0,212,255,0.05); }
+
+/* Modal */
+.modal-overlay {
+  display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7); z-index: 100; justify-content: center;
+  align-items: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 24px; width: 90%; max-width: 500px; max-height: 80vh; overflow-y: auto;
+}
+.modal h3 { margin-bottom: 16px; }
+.form-group { margin-bottom: 14px; }
+.form-group label {
+  display: block; font-size: 12px; color: var(--dim); margin-bottom: 6px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.form-group input, .form-group select, .form-group textarea {
+  width: 100%; padding: 10px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-size: 14px; outline: none;
+}
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+  border-color: var(--accent);
+}
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+
+/* Speed Test */
+.speed-gauge {
+  text-align: center; padding: 20px;
+}
+.speed-value { font-size: 48px; font-weight: 800; }
+.speed-unit { font-size: 14px; color: var(--dim); }
+.speed-label { font-size: 12px; color: var(--dim); margin-top: 4px; }
+
+/* Toast */
+.toast-container { position: fixed; top: 20px; right: 20px; z-index: 200; }
+.toast {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 20px; margin-bottom: 8px; font-size: 13px; min-width: 250px;
+  animation: slideIn 0.3s ease;
+}
+.toast.success { border-left: 3px solid var(--accent2); }
+.toast.error { border-left: 3px solid var(--red); }
+.toast.info { border-left: 3px solid var(--accent); }
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* Sections */
+.section { display: none; }
+.section.active { display: block; }
+
+/* Wifi Info */
+.wifi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
+}
+.wifi-item {
+  background: var(--card2); padding: 14px; border-radius: 8px;
+}
+.wifi-item .label { font-size: 11px; color: var(--dim); text-transform: uppercase; margin-bottom: 4px; }
+.wifi-item .value { font-size: 16px; font-weight: 600; }
+
+/* Loading */
+.spinner {
+  display: inline-block; width: 16px; height: 16px;
+  border: 2px solid var(--border); border-top: 2px solid var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .sidebar { transform: translateX(-100%); }
+  .sidebar.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .device-grid { grid-template-columns: 1fr; }
+  .stats-grid { grid-template-columns: 1fr 1fr; }
+  .mobile-menu { display: block !important; }
+}
+.mobile-menu {
+  display: none; position: fixed; top: 15px; left: 15px; z-index: 51;
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; cursor: pointer; font-size: 20px;
+}
+</style>
+</head>
+<body>
+
+<div class="toast-container" id="toasts"></div>
+<button class="mobile-menu" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">&#128274;</div>
+      <div>
+        <h1>NetManager</h1>
+        <span>Network Dashboard</span>
+      </div>
+    </div>
+
+    <button class="nav-item active" data-section="overview"><span class="icon">&#128200;</span> Overview</button>
+    <button class="nav-item" data-section="devices"><span class="icon">&#128421;</span> Devices <span class="nav-badge" id="navDeviceCount">0</span></button>
+    <button class="nav-item" data-section="network-map"><span class="icon">&#127760;</span> Network Map</button>
+    <button class="nav-item" data-section="bandwidth"><span class="icon">&#128246;</span> Bandwidth</button>
+    <button class="nav-item" data-section="speedtest"><span class="icon">&#9889;</span> Speed Test</button>
+    <button class="nav-item" data-section="wifi-info"><span class="icon">&#128246;</span> WiFi Info</button>
+    <button class="nav-item" data-section="alerts"><span class="icon">&#128276;</span> Alerts <span class="nav-badge" id="navAlertCount" style="display:none">0</span></button>
+    <button class="nav-item" data-section="parental"><span class="icon">&#128119;</span> Parental Controls</button>
+    <button class="nav-item" data-section="tools"><span class="icon">&#128295;</span> Tools</button>
+
+    <div class="sidebar-footer">
+      <div style="font-size:12px; color:var(--dim); display:flex; align-items:center; gap:8px;">
+        <span class="status-dot online" id="scannerStatus"></span>
+        <span id="scannerText">Scanner Active</span>
+      </div>
+      <div style="font-size:11px; color:var(--dim); margin-top:8px;" id="lastScanTime">Last scan: --</div>
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main">
+
+    <!-- ========== OVERVIEW ========== -->
+    <div class="section active" id="sec-overview">
+      <div class="page-header">
+        <h2>Network Overview</h2>
+        <div class="header-actions">
+          <button class="btn btn-primary" onclick="manualScan()"><span class="spinner" id="scanSpinner" style="display:none"></span> Scan Network</button>
+          <button class="btn btn-outline" onclick="exportDevices('csv')">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card blue">
+          <div class="stat-label">Online Devices</div>
+          <div class="stat-value" id="statOnline">0</div>
+          <div class="stat-sub" id="statTotal">0 total known</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-label">Network</div>
+          <div class="stat-value" style="font-size:18px" id="statNetwork">--</div>
+          <div class="stat-sub" id="statGateway">Gateway: --</div>
+        </div>
+        <div class="stat-card orange">
+          <div class="stat-label">Unknown Devices</div>
+          <div class="stat-value" id="statUnknown">0</div>
+          <div class="stat-sub">Not marked as known</div>
+        </div>
+        <div class="stat-card red">
+          <div class="stat-label">Blocked</div>
+          <div class="stat-value" id="statBlocked">0</div>
+          <div class="stat-sub">Devices blocked</div>
+        </div>
+        <div class="stat-card purple">
+          <div class="stat-label">Alerts</div>
+          <div class="stat-value" id="statAlerts">0</div>
+          <div class="stat-sub">Unread alerts</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header">
+            <h3>Online Devices</h3>
+            <button class="btn btn-sm btn-outline" onclick="switchSection('devices')">View All</button>
+          </div>
+          <div id="overviewDevices"></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Recent Alerts</h3>
+            <button class="btn btn-sm btn-outline" onclick="switchSection('alerts')">View All</button>
+          </div>
+          <div id="overviewAlerts" style="max-height:300px; overflow-y:auto;"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><h3>Bandwidth</h3></div>
+        <div class="chart-container"><canvas id="overviewBandwidthChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ========== DEVICES ========== -->
+    <div class="section" id="sec-devices">
+      <div class="page-header">
+        <h2>Connected Devices</h2>
+        <div class="header-actions">
+          <select id="deviceFilter" onchange="renderDevices()" style="padding:8px 12px; background:var(--card); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:13px;">
+            <option value="all">All Devices</option>
+            <option value="online">Online Only</option>
+            <option value="offline">Offline Only</option>
+            <option value="blocked">Blocked</option>
+            <option value="unknown">Unknown</option>
+          </select>
+          <button class="btn btn-primary" onclick="manualScan()">Scan Now</button>
+        </div>
+      </div>
+      <div class="device-grid" id="deviceGrid"></div>
+    </div>
+
+    <!-- ========== NETWORK MAP ========== -->
+    <div class="section" id="sec-network-map">
+      <div class="page-header"><h2>Network Topology</h2></div>
+      <div class="card">
+        <div id="network-map"></div>
+      </div>
+    </div>
+
+    <!-- ========== BANDWIDTH ========== -->
+    <div class="section" id="sec-bandwidth">
+      <div class="page-header"><h2>Bandwidth Monitor</h2></div>
+      <div class="stats-grid" id="bandwidthStats"></div>
+      <div class="card">
+        <div class="card-header"><h3>Real-Time Traffic</h3></div>
+        <div class="chart-container"><canvas id="bandwidthChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- ========== SPEED TEST ========== -->
+    <div class="section" id="sec-speedtest">
+      <div class="page-header"><h2>Internet Speed Test</h2></div>
+      <div class="card" style="text-align:center; padding:40px;">
+        <div id="speedTestResult" style="display:none;">
+          <div class="grid-3" style="max-width:600px; margin:0 auto 30px;">
+            <div class="speed-gauge">
+              <div class="speed-value" style="color:var(--accent);" id="stDownload">--</div>
+              <div class="speed-unit">Mbps</div>
+              <div class="speed-label">Download</div>
+            </div>
+            <div class="speed-gauge">
+              <div class="speed-value" style="color:var(--accent2);" id="stUpload">--</div>
+              <div class="speed-unit">Mbps</div>
+              <div class="speed-label">Upload</div>
+            </div>
+            <div class="speed-gauge">
+              <div class="speed-value" style="color:var(--orange);" id="stPing">--</div>
+              <div class="speed-unit">ms</div>
+              <div class="speed-label">Ping</div>
+            </div>
+          </div>
+          <div style="color:var(--dim); font-size:13px;" id="stServer"></div>
+        </div>
+        <button class="btn btn-primary" id="speedTestBtn" onclick="runSpeedTest()" style="padding:16px 40px; font-size:18px;">
+          &#9889; Run Speed Test
+        </button>
+        <p style="color:var(--dim); font-size:13px; margin-top:12px;" id="stStatus"></p>
+      </div>
+    </div>
+
+     <!-- ========== WIFI INFO ========== -->
+    <div class="section" id="sec-wifi-info">
+      <div class="page-header"><h2>WiFi Information</h2></div>
+      <div class="card">
+        <div class="wifi-grid" id="wifiInfoGrid"></div>
+      </div>
+      <div class="card" style="margin-top:20px;">
+        <div class="card-header"><h3>Network Interfaces</h3></div>
+        <div id="interfacesList"></div>
+      </div>
+      <div class="card" style="margin-top:20px;">
+        <div class="card-header">
+          <h3>WiFi Security</h3>
+          <button class="btn btn-sm btn-outline" onclick="refreshWifiSecurity()">Refresh</button>
+        </div>
+        <div id="wifiSecurityInfo"></div>
+      </div>
+    </div>
+
+    <!-- ========== ALERTS ========== -->
+    <div class="section" id="sec-alerts">
+      <div class="page-header">
+        <h2>Alerts</h2>
+        <button class="btn btn-outline" onclick="markAlertsRead()">Mark All Read</button>
+      </div>
+      <div class="card">
+        <div id="alertsList"></div>
+      </div>
+    </div>
+
+    <!-- ========== PARENTAL CONTROLS ========== -->
+    <div class="section" id="sec-parental">
+      <div class="page-header">
+        <h2>Parental Controls</h2>
+        <button class="btn btn-primary" onclick="openParentalModal()">+ Add Rule</button>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>Device</th><th>Day</th><th>Block From</th><th>Block Until</th><th>Actions</th></tr></thead>
+          <tbody id="parentalTable"></tbody>
+        </table>
+        <div id="parentalEmpty" style="text-align:center; padding:30px; color:var(--dim);">No parental rules set</div>
+      </div>
+    </div>
+
+    <!-- ========== TOOLS ========== -->
+    <div class="section" id="sec-tools">
+      <div class="page-header"><h2>Network Tools</h2></div>
+      <div class="grid-2">
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Port Scanner</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Scan open ports on a device</p>
+          <div class="form-group">
+            <label>Target Device</label>
+            <select id="portScanTarget" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);"></select>
+          </div>
+          <div class="form-group">
+            <label>Port Range</label>
+            <input type="text" id="portScanRange" value="1-1024" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);">
+          </div>
+          <button class="btn btn-primary" id="portScanBtn" onclick="runPortScan()">Scan Ports</button>
+          <div id="portScanResults" style="margin-top:16px; max-height:300px; overflow-y:auto;"></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Vulnerability Scanner</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Scan for common vulnerabilities</p>
+          <div class="form-group">
+            <label>Target Device</label>
+            <select id="vulnScanTarget" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);"></select>
+          </div>
+          <button class="btn btn-primary" id="vulnScanBtn" onclick="runVulnScan()">Scan Vulnerabilities</button>
+          <div id="vulnScanResults" style="margin-top:16px; max-height:300px; overflow-y:auto;"></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Packet Sniffer</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Capture and analyze network packets</p>
+          <div class="form-group">
+            <label>Interface (optional)</label>
+            <input type="text" id="packetInterface" placeholder="e.g., eth0, wlan0" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);">
+          </div>
+          <div class="form-group">
+            <label>Filter (BPF syntax)</label>
+            <input type="text" id="packetFilter" placeholder="e.g., port 80 or host 192.168.1.1" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);">
+          </div>
+          <button class="btn btn-primary" id="packetStartBtn" onclick="startPacketCapture()">Start Capture</button>
+          <button class="btn btn-outline" id="packetStopBtn" onclick="stopPacketCapture()" style="margin-left:8px;">Stop Capture</button>
+          <button class="btn btn-outline" id="packetClearBtn" onclick="clearPacketCapture()" style="margin-left:8px;">Clear Data</button>
+          <div id="packetStatus" style="margin-top:8px; font-size:12px; color:var(--dim);"></div>
+          <div id="packetResults" style="margin-top:16px; max-height:300px; overflow-y:auto;"></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Send Network Message</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Send a message to a device (Windows targets)</p>
+          <div class="form-group">
+            <label>Target Device</label>
+            <select id="msgTarget" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);"></select>
+          </div>
+          <div class="form-group">
+            <label>Message</label>
+            <textarea id="msgText" rows="3" placeholder="Type your message..." style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); resize:vertical;"></textarea>
+          </div>
+          <button class="btn btn-primary" onclick="sendMessage()">Send Message</button>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Export Data</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Download device data</p>
+          <button class="btn btn-outline" onclick="exportDevices('csv')" style="margin-right:8px;">Export CSV</button>
+          <button class="btn btn-outline" onclick="exportDevices('json')">Export JSON</button>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">Quick Actions</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Common network operations</p>
+          <button class="btn btn-primary" onclick="manualScan()" style="margin-bottom:8px; width:100%;">Full Network Scan</button>
+          <button class="btn btn-outline" onclick="refreshAll()" style="width:100%;">Refresh All Data</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Device Detail Modal -->
+<div class="modal-overlay" id="deviceModal">
+  <div class="modal">
+    <h3 id="modalDeviceName">Device Details</h3>
+    <div class="form-group">
+      <label>Custom Name</label>
+      <input type="text" id="modalCustomName" placeholder="e.g. Dad's Laptop">
+    </div>
+    <div class="form-group">
+      <label>Device Type</label>
+      <select id="modalDeviceType">
+        <option value="unknown">Unknown</option>
+        <option value="phone">Phone</option>
+        <option value="tablet">Tablet</option>
+        <option value="laptop">Laptop</option>
+        <option value="desktop">Desktop</option>
+        <option value="tv">Smart TV</option>
+        <option value="printer">Printer</option>
+        <option value="smart_speaker">Smart Speaker</option>
+        <option value="camera">Camera</option>
+        <option value="iot">IoT Device</option>
+        <option value="router">Router</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Notes</label>
+      <textarea id="modalNotes" rows="2" placeholder="Optional notes..."></textarea>
+    </div>
+    <div class="form-group">
+      <label><input type="checkbox" id="modalKnown"> Mark as Known Device</label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('deviceModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveDeviceDetails()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Parental Rule Modal -->
+<div class="modal-overlay" id="parentalModal">
+  <div class="modal">
+    <h3>Add Parental Rule</h3>
+    <div class="form-group">
+      <label>Device</label>
+      <select id="parentalDevice"></select>
+    </div>
+    <div class="form-group">
+      <label>Day of Week</label>
+      <select id="parentalDay">
+        <option value="everyday">Every Day</option>
+        <option value="weekdays">Weekdays</option>
+        <option value="weekends">Weekends</option>
+        <option value="monday">Monday</option>
+        <option value="tuesday">Tuesday</option>
+        <option value="wednesday">Wednesday</option>
+        <option value="thursday">Thursday</option>
+        <option value="friday">Friday</option>
+        <option value="saturday">Saturday</option>
+        <option value="sunday">Sunday</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Block From</label>
+      <input type="time" id="parentalStart" value="22:00">
+    </div>
+    <div class="form-group">
+      <label>Block Until</label>
+      <input type="time" id="parentalEnd" value="07:00">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('parentalModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="addParentalRule()">Add Rule</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============ STATE ============
+let devices = [];
+let alerts = [];
+let stats = {};
+let currentDeviceMac = null;
+let bandwidthHistory = [];
+let bandwidthChart = null;
+let overviewBandwidthChart = null;
+
+const DEVICE_ICONS = {
+  phone: '&#128241;', tablet: '&#128241;', laptop: '&#128187;', desktop: '&#128421;',
+  tv: '&#128250;', printer: '&#128424;', smart_speaker: '&#128266;', camera: '&#128247;',
+  iot: '&#128268;', router: '&#128225;', unknown: '&#128268;', other: '&#128268;'
+};
+
+// ============ API ============
+async function api(url, opts = {}) {
+  try {
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json' },
+      ...opts,
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    return await res.json();
+  } catch (e) {
+    console.error('API error:', e);
+    return null;
+  }
+}
+
+// ============ DATA LOADING ============
+async function loadStats() {
+  const data = await api('/api/stats');
+  if (!data) return;
+  stats = data;
+  document.getElementById('statOnline').textContent = data.online_devices;
+  document.getElementById('statTotal').textContent = `${data.total_devices} total known`;
+  document.getElementById('statNetwork').textContent = data.network_range;
+  document.getElementById('statGateway').textContent = `Gateway: ${data.gateway}`;
+  document.getElementById('statUnknown').textContent = data.unknown_devices;
+  document.getElementById('statBlocked').textContent = data.blocked_devices;
+  document.getElementById('statAlerts').textContent = data.unread_alerts;
+  document.getElementById('navDeviceCount').textContent = data.online_devices;
+
+  if (data.unread_alerts > 0) {
+    document.getElementById('navAlertCount').textContent = data.unread_alerts;
+    document.getElementById('navAlertCount').style.display = 'inline';
+  } else {
+    document.getElementById('navAlertCount').style.display = 'none';
+  }
+
+  if (data.last_scan) {
+    const t = new Date(data.last_scan.timestamp);
+    document.getElementById('lastScanTime').textContent = `Last scan: ${t.toLocaleTimeString()}`;
+  }
+}
+
+async function loadDevices() {
+  const data = await api('/api/devices');
+  if (!data) return;
+  devices = data;
+  renderDevices();
+  renderOverviewDevices();
+  populateDeviceSelects();
+}
+
+async function loadAlerts() {
+  const data = await api('/api/alerts');
+  if (!data) return;
+  alerts = data;
+  renderAlerts();
+  renderOverviewAlerts();
+}
+
+async function loadBandwidth() {
+  const data = await api('/api/bandwidth');
+  if (!data) return;
+  renderBandwidthStats(data);
+  updateBandwidthChart(data);
+}
+
+async function loadWifiInfo() {
+  const data = await api('/api/wifi');
+  if (!data) return;
+  const grid = document.getElementById('wifiInfoGrid');
+  grid.innerHTML = `
+    <div class="wifi-item"><div class="label">SSID</div><div class="value">${data.ssid}</div></div>
+    <div class="wifi-item"><div class="label">Signal</div><div class="value">${data.signal}</div></div>
+    <div class="wifi-item"><div class="label">Channel</div><div class="value">${data.channel}</div></div>
+    <div class="wifi-item"><div class="label">Frequency</div><div class="value">${data.frequency}</div></div>
+    <div class="wifi-item"><div class="label">Security</div><div class="value">${data.security}</div></div>
+    <div class="wifi-item"><div class="label">BSSID</div><div class="value" style="font-size:12px;font-family:monospace;">${data.bssid}</div></div>
+  `;
+
+  const netInfo = await api('/api/network-info');
+  if (netInfo) {
+    const il = document.getElementById('interfacesList');
+    let html = '<table><thead><tr><th>Interface</th><th>IPv4</th><th>Netmask</th><th>MAC</th></tr></thead><tbody>';
+    for (const [name, info] of Object.entries(netInfo.interfaces)) {
+      html += `<tr><td style="font-weight:600;">${name}</td><td style="font-family:monospace;">${info.ipv4 || '-'}</td><td style="font-family:monospace;">${info.netmask || '-'}</td><td style="font-family:monospace;font-size:11px;">${info.mac || '-'}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    il.innerHTML = html;
+  }
+  
+  // Load WiFi security info
+  loadWifiSecurity();
+}
+
+async function loadWifiSecurity() {
+  const data = await api('/api/wifi/security');
+  if (!data) return;
+  
+  const wifi = data.wifi || {};
+  const security = data.security || {};
+  
+  const el = document.getElementById('wifiSecurityInfo');
+  let html = '';
+  
+  // Encryption info
+  html += `<div style="margin-bottom:8px;"><strong>Encryption:</strong> ${security.encryption || 'Unknown'}</div>`;
+  
+  // WPS info
+  html += `<div style="margin-bottom:8px;"><strong>WPS:</strong> ${security.wps || 'Unknown'}</div>`;
+  
+  // Hidden SSID
+  html += `<div style="margin-bottom:8px;"><strong>Hidden SSID:</strong> ${security.hidden_ssid ? 'Yes' : 'No'}</div>`;
+  
+  // MAC Filtering
+  html += `<div style="margin-bottom:8px;"><strong>MAC Filtering:</strong> ${security.mac_filtering || 'Unknown'}</div>`;
+  
+  // Recommendations
+  if (security.recommendations && security.recommendations.length > 0) {
+    html += `<div style="margin-bottom:8px;"><strong>Recommendations:</strong></div><ul>`;
+    security.recommendations.forEach(rec => {
+      html += `<li style="color:var(--orange); font-size:12px;">${rec}</li>`;
+    });
+    html += '</ul>';
+  } else {
+    html += `<div style="margin-bottom:8px;"><strong>Recommendations:</strong> No security issues detected</div>`;
+  }
+  
+  el.innerHTML = html;
+}
+
+// ============ RENDERING ============
+function renderDevices() {
+  const filter = document.getElementById('deviceFilter')?.value || 'all';
+  let filtered = devices;
+  if (filter === 'online') filtered = devices.filter(d => d.is_online);
+  else if (filter === 'offline') filtered = devices.filter(d => !d.is_online);
+  else if (filter === 'blocked') filtered = devices.filter(d => d.is_blocked);
+  else if (filter === 'unknown') filtered = devices.filter(d => !d.is_known);
+
+  const grid = document.getElementById('deviceGrid');
+  if (filtered.length === 0) {
+    grid.innerHTML = '<div style="text-align:center;padding:40px;color:var(--dim);grid-column:1/-1;">No devices found. Run a scan to discover devices.</div>';
+    return;
+  }
+
+  grid.innerHTML = filtered.map(d => {
+    const name = d.custom_name || d.hostname || d.ip;
+    const icon = DEVICE_ICONS[d.device_type] || DEVICE_ICONS.unknown;
+    const statusClass = d.is_blocked ? 'blocked-badge' : (d.is_online ? 'online' : 'offline');
+    const statusText = d.is_blocked ? 'BLOCKED' : (d.is_online ? 'Online' : 'Offline');
+    const ago = timeAgo(d.last_seen);
+    return `
+      <div class="device-card ${d.is_blocked ? 'blocked' : ''}">
+        <div class="device-status ${statusClass}">${statusText}</div>
+        <div class="device-top">
+          <div class="device-icon">${icon}</div>
+          <div>
+            <div class="device-name">${escHtml(name)}</div>
+            <div class="device-ip">${d.ip}</div>
+          </div>
+        </div>
+        <div class="device-meta">
+          <div><span class="label">MAC: </span><span class="val">${d.mac}</span></div>
+          <div><span class="label">Vendor: </span><span class="val">${escHtml(d.vendor)}</span></div>
+          <div><span class="label">Type: </span><span class="val">${d.device_type}</span></div>
+          <div><span class="label">Last seen: </span><span class="val">${ago}</span></div>
+        </div>
+        <div class="device-actions">
+          <button class="btn btn-sm btn-outline" onclick="editDevice('${d.mac}')">Edit</button>
+          ${d.is_blocked
+            ? `<button class="btn btn-sm btn-success" onclick="unblockDevice('${d.mac}')">Unblock</button>`
+            : `<button class="btn btn-sm btn-danger" onclick="blockDevice('${d.mac}')">Block</button>`
+          }
+          <button class="btn btn-sm btn-outline" onclick="portScanDevice('${d.mac}')">Scan Ports</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderOverviewDevices() {
+  const online = devices.filter(d => d.is_online).slice(0, 8);
+  const el = document.getElementById('overviewDevices');
+  if (online.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--dim);">No devices online</div>';
+    return;
+  }
+  el.innerHTML = online.map(d => {
+    const name = d.custom_name || d.hostname || d.ip;
+    const icon = DEVICE_ICONS[d.device_type] || DEVICE_ICONS.unknown;
+    return `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">
+        <span style="font-size:20px;">${icon}</span>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:600;">${escHtml(name)}</div>
+          <div style="font-size:11px;color:var(--dim);font-family:monospace;">${d.ip}</div>
+        </div>
+        <span class="status-dot online"></span>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderAlerts() {
+  const el = document.getElementById('alertsList');
+  if (alerts.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:30px;color:var(--dim);">No alerts</div>';
+    return;
+  }
+  el.innerHTML = alerts.map(a => `
+    <div class="alert-item ${!a.is_read ? 'alert-unread' : ''}">
+      <span class="alert-dot ${a.alert_type || 'default'}"></span>
+      <span>${escHtml(a.message)}</span>
+      <span class="alert-time">${timeAgo(a.timestamp)}</span>
+    </div>
+  `).join('');
+}
+
+function renderOverviewAlerts() {
+  const recent = alerts.slice(0, 5);
+  const el = document.getElementById('overviewAlerts');
+  if (recent.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--dim);">No alerts</div>';
+    return;
+  }
+  el.innerHTML = recent.map(a => `
+    <div class="alert-item ${!a.is_read ? 'alert-unread' : ''}">
+      <span class="alert-dot ${a.alert_type || 'default'}"></span>
+      <span style="font-size:12px;">${escHtml(a.message)}</span>
+      <span class="alert-time">${timeAgo(a.timestamp)}</span>
+    </div>
+  `).join('');
+}
+
+function renderBandwidthStats(data) {
+  const el = document.getElementById('bandwidthStats');
+  let html = '';
+  for (const [iface, info] of Object.entries(data)) {
+    html += `
+      <div class="stat-card blue">
+        <div class="stat-label">${iface}</div>
+        <div class="stat-value" style="font-size:20px;">&#8595; ${formatBytes(info.download_speed)}/s</div>
+        <div class="stat-sub">&#8593; ${formatBytes(info.upload_speed)}/s | Total: ${formatBytes(info.total_recv + info.total_sent)}</div>
+      </div>
+    `;
+  }
+  el.innerHTML = html || '<div class="stat-card blue"><div class="stat-label">No Data</div><div class="stat-value" style="font-size:16px;">Collecting...</div></div>';
+}
+
+function populateDeviceSelects() {
+  const onlineDevices = devices.filter(d => d.is_online);
+  const options = onlineDevices.map(d => {
+    const name = d.custom_name || d.hostname || d.ip;
+    return `<option value="${d.mac}">${escHtml(name)} (${d.ip})</option>`;
+  }).join('');
+
+  ['portScanTarget', 'msgTarget', 'parentalDevice', 'vulnScanTarget'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = options || '<option>No devices found</option>';
+  });
+}
+
+// ============ CHARTS ============
+function initCharts() {
+  const chartOpts = {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#64748b' } } },
+    scales: {
+      x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(30,45,61,0.5)' } },
+      y: { ticks: { color: '#64748b', callback: v => formatBytes(v) + '/s' }, grid: { color: 'rgba(30,45,61,0.5)' } }
+    }
+  };
+
+  bandwidthChart = new Chart(document.getElementById('bandwidthChart'), {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Download', data: [], borderColor: '#00d4ff', backgroundColor: 'rgba(0,212,255,0.1)', fill: true, tension: 0.4 },
+        { label: 'Upload', data: [], borderColor: '#00ff88', backgroundColor: 'rgba(0,255,136,0.1)', fill: true, tension: 0.4 }
+      ]
+    },
+    options: chartOpts
+  });
+
+  overviewBandwidthChart = new Chart(document.getElementById('overviewBandwidthChart'), {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Download', data: [], borderColor: '#00d4ff', backgroundColor: 'rgba(0,212,255,0.1)', fill: true, tension: 0.4 },
+        { label: 'Upload', data: [], borderColor: '#00ff88', backgroundColor: 'rgba(0,255,136,0.1)', fill: true, tension: 0.4 }
+      ]
+    },
+    options: chartOpts
+  });
+}
+
+function updateBandwidthChart(data) {
+  const now = new Date().toLocaleTimeString();
+  let dl = 0, ul = 0;
+  for (const info of Object.values(data)) {
+    dl += info.download_speed || 0;
+    ul += info.upload_speed || 0;
+  }
+
+  [bandwidthChart, overviewBandwidthChart].forEach(chart => {
+    if (!chart) return;
+    chart.data.labels.push(now);
+    chart.data.datasets[0].data.push(dl);
+    chart.data.datasets[1].data.push(ul);
+    if (chart.data.labels.length > 30) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+      chart.data.datasets[1].data.shift();
+    }
+    chart.update('none');
+  });
+}
+
+// ============ NETWORK MAP ============
+function renderNetworkMap() {
+  const container = document.getElementById('network-map');
+  const nodes = [
+    { id: 'router', label: `Router\n${stats.gateway || '192.168.1.1'}`, shape: 'image',
+      image: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60"><rect width="60" height="60" rx="12" fill="%23111827" stroke="%2300d4ff" stroke-width="2"/><text x="30" y="36" text-anchor="middle" fill="%2300d4ff" font-size="28">&#128225;</text></svg>',
+      size: 35, font: { color: '#e2e8f0', size: 12 }
+    },
+    { id: 'internet', label: 'Internet', shape: 'image',
+      image: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60"><rect width="60" height="60" rx="30" fill="%23111827" stroke="%23a855f7" stroke-width="2"/><text x="30" y="38" text-anchor="middle" fill="%23a855f7" font-size="28">&#127760;</text></svg>',
+      size: 30, font: { color: '#e2e8f0', size: 12 }
+    }
+  ];
+  const edges = [{ from: 'internet', to: 'router', color: { color: '#a855f7' }, width: 3, dashes: true }];
+
+  devices.forEach(d => {
+    const name = d.custom_name || d.hostname || d.ip;
+    const color = d.is_blocked ? '#ff4757' : (d.is_online ? '#00ff88' : '#64748b');
+    nodes.push({
+      id: d.mac, label: `${name}\n${d.ip}`,
+      shape: 'dot', size: 15, color: { background: color, border: color },
+      font: { color: '#e2e8f0', size: 10 }
+    });
+    edges.push({ from: 'router', to: d.mac, color: { color: color + '66' }, width: d.is_online ? 2 : 1 });
+  });
+
+  new vis.Network(container, { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) }, {
+    physics: { solver: 'forceAtlas2Based', forceAtlas2Based: { gravitationalConstant: -80, springLength: 150 } },
+    interaction: { hover: true, tooltipDelay: 100 },
+    layout: { randomSeed: 42 }
+  });
+}
+
+// ============ ACTIONS ============
+async function manualScan() {
+  const spinner = document.getElementById('scanSpinner');
+  if (spinner) spinner.style.display = 'inline-block';
+  toast('Scanning network...', 'info');
+  const result = await api('/api/scan', { method: 'POST' });
+  if (spinner) spinner.style.display = 'none';
+  if (result?.success) {
+    toast(`Found ${result.devices_found} devices (${result.new_devices} new) in ${result.duration}s`, 'success');
+    refreshAll();
+  } else {
+    toast('Scan failed', 'error');
+  }
+}
+
+async function blockDevice(mac) {
+  if (!confirm('Block this device from the network? This uses ARP spoofing and requires root.')) return;
+  const result = await api(`/api/devices/${mac}/block`, { method: 'POST' });
+  if (result?.success) {
+    toast('Device blocked', 'success');
+    loadDevices();
+    loadStats();
+  } else {
+    toast(result?.message || 'Block failed', 'error');
+  }
+}
+
+async function unblockDevice(mac) {
+  const result = await api(`/api/devices/${mac}/unblock`, { method: 'POST' });
+  if (result?.success) {
+    toast('Device unblocked', 'success');
+    loadDevices();
+    loadStats();
+  } else {
+    toast(result?.message || 'Unblock failed', 'error');
+  }
+}
+
+function editDevice(mac) {
+  currentDeviceMac = mac;
+  const d = devices.find(x => x.mac === mac);
+  if (!d) return;
+  document.getElementById('modalDeviceName').textContent = d.custom_name || d.hostname || d.ip;
+  document.getElementById('modalCustomName').value = d.custom_name || '';
+  document.getElementById('modalDeviceType').value = d.device_type || 'unknown';
+  document.getElementById('modalNotes').value = d.notes || '';
+  document.getElementById('modalKnown').checked = !!d.is_known;
+  document.getElementById('deviceModal').classList.add('active');
+}
+
+async function saveDeviceDetails() {
+  if (!currentDeviceMac) return;
+  await api(`/api/devices/${currentDeviceMac}`, {
+    method: 'PUT',
+    body: {
+      custom_name: document.getElementById('modalCustomName').value,
+      device_type: document.getElementById('modalDeviceType').value,
+      notes: document.getElementById('modalNotes').value,
+      is_known: document.getElementById('modalKnown').checked ? 1 : 0
+    }
+  });
+  closeModal('deviceModal');
+  toast('Device updated', 'success');
+  loadDevices();
+}
+
+function portScanDevice(mac) {
+  switchSection('tools');
+  const select = document.getElementById('portScanTarget');
+  if (select) select.value = mac;
+}
+
+async function runPortScan() {
+  const mac = document.getElementById('portScanTarget').value;
+  const range = document.getElementById('portScanRange').value;
+  const btn = document.getElementById('portScanBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Scanning...';
+
+  const result = await api(`/api/devices/${mac}/portscan`, { method: 'POST', body: { range } });
+  btn.disabled = false;
+  btn.textContent = 'Scan Ports';
+
+  const el = document.getElementById('portScanResults');
+  if (result?.ports?.length > 0) {
+    el.innerHTML = `<table><thead><tr><th>Port</th><th>Service</th><th>State</th><th>Version/Banner</th></tr></thead><tbody>
+      ${result.ports.map(p => `<tr><td style="font-family:monospace;font-weight:700;">${p.port}</td><td>${p.service}</td><td style="color:var(--accent2);">${p.state}</td><td style="font-family:monospace;font-size:11px;">${p.version || '-'}</td></tr>`).join('')}
+    </tbody></table>`;
+  } else {
+    el.innerHTML = '<div style="padding:12px;color:var(--dim);text-align:center;">No open ports found</div>';
+  }
+}
+
+async function runVulnScan() {
+  const mac = document.getElementById('vulnScanTarget').value;
+  const btn = document.getElementById('vulnScanBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Scanning...';
+
+  const result = await api(`/api/devices/${mac}/vulnscan`, { method: 'POST' });
+  btn.disabled = false;
+  btn.textContent = 'Scan Vulnerabilities';
+
+  const el = document.getElementById('vulnScanResults');
+  if (result?.vulnerabilities?.length > 0) {
+    el.innerHTML = `<div style="margin-bottom:12px;"><strong>${result.vulnerabilities.length} potential vulnerabilities found</strong></div>
+      <table><thead><tr><th>Port</th><th>Service</th><th>Vulnerability</th><th>Severity</th><th>Description</th></tr></thead><tbody>
+        ${result.vulnerabilities.map(v => `
+          <tr>
+            <td style="font-family:monospace;font-weight:700;">${v.port}</td>
+            <td>${v.service}</td>
+            <td>${v.vulnerability}</td>
+            <td style="color: ${v.severity === 'high' ? 'var(--red)' : v.severity === 'medium' ? 'var(--orange)' : 'var(--yellow)'}; font-weight:600;">${v.severity}</td>
+            <td style="font-size:12px;">${v.description}</td>
+          </tr>`).join('')}
+      </tbody></table>`;
+  } else {
+    el.innerHTML = '<div style="padding:12px;color:var(--dim);text-align:center;">No vulnerabilities detected</div>';
+  }
+}
+
+async function startPacketCapture() {
+  const interfaceInput = document.getElementById('packetInterface').value;
+  const filterInput = document.getElementById('packetFilter').value;
+  const btn = document.getElementById('packetStartBtn');
+  const statusEl = document.getElementById('packetStatus');
+  
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Starting...';
+  statusEl.textContent = 'Starting packet capture...';
+  
+  const result = await api('/api/packet-capture/start', { 
+    method: 'POST',
+    body: {
+      interface: interfaceInput || null,
+      filter: filterInput,
+      count: 0
+    }
+  });
+  
+  btn.disabled = false;
+  btn.textContent = 'Start Capture';
+  
+  if (result?.success) {
+    statusEl.textContent = result.message;
+    statusEl.style.color = 'var(--accent2)';
+    // Start polling for packet data
+    startPacketPolling();
+  } else {
+    statusEl.textContent = result?.message || 'Failed to start capture';
+    statusEl.style.color = 'var(--red)';
+  }
+}
+
+async function stopPacketCapture() {
+  const btn = document.getElementById('packetStopBtn');
+  const statusEl = document.getElementById('packetStatus');
+  
+  btn.disabled = true;
+  btn.textContent = 'Stopping...';
+  
+  const result = await api('/api/packet-capture/stop', { method: 'POST' });
+  
+  btn.disabled = false;
+  btn.textContent = 'Stop Capture';
+  
+  if (result?.success) {
+    statusEl.textContent = result.message;
+    statusEl.style.color = 'var(--red)';
+    stopPacketPolling();
+  } else {
+    statusEl.textContent = result?.message || 'Failed to stop capture';
+    statusEl.style.color = 'var(--red)';
+  }
+}
+
+async function clearPacketCapture() {
+  const btn = document.getElementById('packetClearBtn');
+  const statusEl = document.getElementById('packetStatus');
+  const resultsEl = document.getElementById('packetResults');
+  
+  btn.disabled = true;
+  btn.textContent = 'Clearing...';
+  
+  const result = await api('/api/packet-capture/clear', { method: 'POST' });
+  
+  btn.disabled = false;
+  btn.textContent = 'Clear Data';
+  
+  if (result?.success) {
+    statusEl.textContent = result.message;
+    statusEl.style.color = 'var(--accent2)';
+    resultsEl.innerHTML = '<div style="padding:12px;color:var(--dim);text-align:center;">Packet data cleared</div>';
+  } else {
+    statusEl.textContent = result?.message || 'Failed to clear capture';
+    statusEl.style.color = 'var(--red)';
+  }
+}
+
+let packetPollingInterval = null;
+
+function startPacketPolling() {
+  packetPollingInterval = setInterval(updatePacketDisplay, 2000); // Update every 2 seconds
+}
+
+function stopPacketPolling() {
+  if (packetPollingInterval) {
+    clearInterval(packetPollingInterval);
+    packetPollingInterval = null;
+  }
+}
+
+async function updatePacketDisplay() {
+  try {
+    const result = await api('/api/packet-capture/data?limit=50');
+    const resultsEl = document.getElementById('packetResults');
+    
+    if (result && result.packets) {
+      if (result.packets.length === 0) {
+        resultsEl.innerHTML = '<div style="padding:12px;color:var(--dim);text-align:center;">No packets captured yet</div>';
+        return;
+      }
+      
+      resultsEl.innerHTML = `
+        <div style="margin-bottom:8px;"><strong>Last ${result.packets.length} packets:</strong></div>
+        <div style="background:var(--card2);padding:12px;border-radius:6px;overflow-x:auto;">
+          <table style="width:100%;font-size:11px;">
+            <thead>
+              <tr>
+                <th style="text-align:left;">Time</th>
+                <th style="text-align:left;">Source</th>
+                <th style="text-align:left;">Destination</th>
+                <th style="text-align:left;">Protocol</th>
+                <th style="text-align:left;">Length</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${result.packets.map(p => {
+                const time = new Date(p.timestamp).toLocaleTimeString();
+                const src = `${p.src_ip}:${p.src_port || ''}`;
+                const dst = `${p.dst_ip}:${p.dst_port || ''}`;
+                const proto = p.protocol_name || 'UNKNOWN';
+                return `
+                  <tr>
+                    <td>${time}</td>
+                    <td>${src}</td>
+                    <td>${dst}</td>
+                    <td>${proto}</td>
+                    <td>${p.length}</td>
+                  </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+  } catch (e) {
+    console.error('Error updating packet display:', e);
+  }
+}
+
+async function sendMessage() {
+  const mac = document.getElementById('msgTarget').value;
+  const message = document.getElementById('msgText').value;
+  if (!message) { toast('Enter a message', 'error'); return; }
+  const result = await api(`/api/devices/${mac}/message`, { method: 'POST', body: { message } });
+  if (result?.success) {
+    toast('Message sent', 'success');
+    document.getElementById('msgText').value = '';
+  } else {
+    toast(result?.message || 'Failed to send', 'error');
+  }
+}
+
+async function runSpeedTest() {
+  const btn = document.getElementById('speedTestBtn');
+  const status = document.getElementById('stStatus');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Testing...';
+  status.textContent = 'Running speed test, this may take 30-60 seconds...';
+
+  const result = await api('/api/speedtest', { method: 'POST' });
+  btn.disabled = false;
+  btn.innerHTML = '&#9889; Run Speed Test';
+
+  if (result?.error) {
+    status.textContent = result.error;
+    return;
+  }
+
+  document.getElementById('stDownload').textContent = result.download;
+  document.getElementById('stUpload').textContent = result.upload;
+  document.getElementById('stPing').textContent = result.ping;
+  document.getElementById('stServer').textContent = `Server: ${result.server} (${result.server_location})`;
+  document.getElementById('speedTestResult').style.display = 'block';
+  status.textContent = '';
+}
+
+async function markAlertsRead() {
+  await api('/api/alerts/read', { method: 'POST' });
+  loadAlerts();
+  loadStats();
+  toast('Alerts marked as read', 'success');
+}
+
+function exportDevices(fmt) {
+  window.open(`/api/export/${fmt}`, '_blank');
+}
+
+async function loadParentalRules() {
+  const rules = await api('/api/parental-rules');
+  const tbody = document.getElementById('parentalTable');
+  const empty = document.getElementById('parentalEmpty');
+  if (!rules || rules.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  tbody.innerHTML = rules.map(r => {
+    const dev = devices.find(d => d.mac === r.device_mac);
+    const name = dev ? (dev.custom_name || dev.hostname || dev.ip) : r.device_mac;
+    return `<tr>
+      <td>${escHtml(name)}</td>
+      <td>${r.day_of_week}</td>
+      <td>${r.start_time}</td>
+      <td>${r.end_time}</td>
+      <td><button class="btn btn-sm btn-danger" onclick="deleteParentalRule(${r.id})">Delete</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function openParentalModal() {
+  document.getElementById('parentalModal').classList.add('active');
+}
+
+async function addParentalRule() {
+  await api('/api/parental-rules', {
+    method: 'POST',
+    body: {
+      device_mac: document.getElementById('parentalDevice').value,
+      day_of_week: document.getElementById('parentalDay').value,
+      start_time: document.getElementById('parentalStart').value,
+      end_time: document.getElementById('parentalEnd').value
+    }
+  });
+  closeModal('parentalModal');
+  toast('Rule added', 'success');
+  loadParentalRules();
+}
+
+async function deleteParentalRule(id) {
+  await api(`/api/parental-rules/${id}`, { method: 'DELETE' });
+  toast('Rule deleted', 'success');
+  loadParentalRules();
+}
+
+// ============ NAVIGATION ============
+function switchSection(name) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById(`sec-${name}`).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelector(`.nav-item[data-section="${name}"]`)?.classList.add('active');
+
+  if (name === 'network-map') renderNetworkMap();
+  if (name === 'wifi-info') {
+    loadWifiInfo();
+    loadWifiSecurity();
+  }
+  if (name === 'parental') loadParentalRules();
+  document.querySelector('.sidebar').classList.remove('open');
+}
+
+document.querySelectorAll('.nav-item').forEach(btn => {
+  btn.addEventListener('click', () => switchSection(btn.dataset.section));
+});
+
+// ============ HELPERS ============
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+function toast(msg, type = 'info') {
+  const container = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(Math.abs(bytes)) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+function timeAgo(dateStr) {
+  if (!dateStr) return 'Never';
+  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
+  if (diff < 60) return 'Just now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function escHtml(str) {
+  if (!str) return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+async function refreshAll() {
+  await Promise.all([loadStats(), loadDevices(), loadAlerts(), loadBandwidth()]);
+}
+
+// ============ INIT ============
+initCharts();
+refreshAll();
+
+// Auto-refresh every 5 seconds
+setInterval(() => {
+  loadBandwidth();
+}, 5000);
+
+// Full refresh every 30 seconds
+setInterval(() => {
+  loadStats();
+  loadDevices();
+  loadAlerts();
+}, 30000);
+</script>
+</body>
+</html>
