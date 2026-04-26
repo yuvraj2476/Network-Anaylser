@@ -332,7 +332,8 @@ def init_db():
             source_mac TEXT,
             source_ip TEXT,
             domain TEXT,
-            visit_count INTEGER DEFAULT 1
+            visit_count INTEGER DEFAULT 1,
+            UNIQUE(source_mac, domain)
         )
     """)
     # SSL CERT TABLE - Store SSL certificate info for local servers
@@ -368,7 +369,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS os_fingerprint_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
-            device_mac TEXT PRIMARY KEY,
+            device_mac TEXT UNIQUE NOT NULL,
             os_guess TEXT,
             confidence INTEGER,
             ttl INTEGER,
@@ -894,6 +895,9 @@ def wifi_security_scan():
         "mac_filtering": "Unknown",
         "recommendations": [],
     }
+
+    # Fetch current WiFi info so we can use it for recommendations below
+    info = get_wifi_info()
 
     try:
         system = platform.system()
@@ -1694,9 +1698,8 @@ def process_dns_query(packet, source_ip, source_mac):
         # Extract base domain (e.g., www.google.com -> google.com)
         base_domain = '.'.join(query_name.split('.')[-2:]) if len(query_name.split('.')) > 1 else query_name
         conn.execute("""
-            INSERT INTO passive_dns_log (timestamp, source_mac, source_ip, domain)
+            INSERT OR IGNORE INTO passive_dns_log (timestamp, source_mac, source_ip, domain)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT DO NOTHING
         """, (dns_entry["timestamp"], source_mac, source_ip, base_domain))
         
         # Update visit count
@@ -2174,8 +2177,12 @@ def check_security_events(devices):
                     ),
                 )
 
-            # Check for MAC address changes (possible MAC spoofing)
-            if existing["mac"] != dev["mac"]:
+            # Check for MAC address changes (possible MAC spoofing):
+            # Look for a different device that previously held the same IP
+            prev_owner = c.execute(
+                "SELECT * FROM devices WHERE ip = ? AND mac != ?", (dev["ip"], dev["mac"])
+            ).fetchone()
+            if prev_owner:
                 c.execute(
                     """
                     INSERT INTO alerts (timestamp, alert_type, message, device_mac)
@@ -2183,7 +2190,7 @@ def check_security_events(devices):
                 """,
                     (
                         datetime.now().isoformat(),
-                        f"MAC address changed for {existing['ip']}: {existing['mac']} -> {dev['mac']}",
+                        f"MAC address changed for {dev['ip']}: {prev_owner['mac']} -> {dev['mac']}",
                         dev["mac"],
                     ),
                 )
@@ -2442,6 +2449,7 @@ def api_unblock_device(mac):
 
 
 @app.route("/api/devices/<mac>/message", methods=["POST"])
+@login_required
 def api_send_message(mac):
     """Send a message to a device."""
     data = request.json
