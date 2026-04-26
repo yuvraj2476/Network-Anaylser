@@ -1,5 +1,21 @@
-# Network-Anaylser
-This is tool which anyalse the wholee network see which devecies are connected and many more features.
+# Network-Analyzer
+
+A powerful real-time network scanner and management dashboard for your home WiFi. Analyzes the whole network to see which devices are connected and many more features.
+
+![Demo](docs/demo.gif)
+
+## Quick Start
+
+```bash
+# Option 1: Run with Docker (recommended)
+docker-compose up
+
+# Option 2: Run directly
+pip install -r requirements.txt
+sudo python3 network_manager.py
+```
+
+Open http://localhost:5000 in your browser.
 
 ---
 
@@ -28,6 +44,14 @@ A powerful real-time network scanner and management dashboard for your home WiFi
 
 ## Setup
 
+### Option 1: Docker (Recommended)
+
+```bash
+docker-compose up
+```
+
+### Option 2: Manual Install
+
 ### 1. Install Python 3.8+
 
 Download from https://python.org if you don't have it.
@@ -35,7 +59,6 @@ Download from https://python.org if you don't have it.
 ### 2. Install Dependencies
 
 ```bash
-cd network-manager
 pip install -r requirements.txt
 ```
 
@@ -113,4 +136,12 @@ http://localhost:5000
 
 ## License
 
-For educational purposes only. Use responsibly on your own networks.
+MIT License — See [LICENSE](LICENSE) for details.
+
+### Disclaimer
+
+**For educational purposes only.** This tool is designed for learning about network security and monitoring your own networks. 
+
+- Only use on networks you own or have explicit permission to test
+- Unauthorized network scanning may be illegal in your jurisdiction
+- The authors are not responsible for any misuse of this software
