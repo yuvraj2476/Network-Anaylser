@@ -306,6 +306,7 @@ tr:hover td { background: rgba(0,212,255,0.03); }
     <button class="nav-item" data-section="bandwidth"><span class="icon">&#128246;</span> Bandwidth</button>
     <button class="nav-item" data-section="speedtest"><span class="icon">&#9889;</span> Speed Test</button>
     <button class="nav-item" data-section="wifi-info"><span class="icon">&#128246;</span> WiFi Info</button>
+    <button class="nav-item" data-section="security"><span class="icon">&#128274;</span> Security <span class="nav-badge" id="navSecurityCount" style="display:none">0</span></button>
     <button class="nav-item" data-section="alerts"><span class="icon">&#128276;</span> Alerts <span class="nav-badge" id="navAlertCount" style="display:none">0</span></button>
     <button class="nav-item" data-section="parental"><span class="icon">&#128119;</span> Parental Controls</button>
     <button class="nav-item" data-section="tools"><span class="icon">&#128295;</span> Tools</button>
@@ -466,6 +467,69 @@ tr:hover td { background: rgba(0,212,255,0.03); }
           <button class="btn btn-sm btn-outline" onclick="refreshWifiSecurity()">Refresh</button>
         </div>
         <div id="wifiSecurityInfo"></div>
+      </div>
+    </div>
+
+    <!-- ========== SECURITY MONITORING ========== -->
+    <div class="section" id="sec-security">
+      <div class="page-header">
+        <h2>Security Monitoring</h2>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-outline btn-sm" onclick="loadDnsQueries()">Refresh DNS</button>
+          <button class="btn btn-outline btn-sm" onclick="loadJa3Fingerprints()">Refresh JA3</button>
+          <button class="btn btn-outline btn-sm" onclick="loadMitmAlerts()">Refresh MITM</button>
+        </div>
+      </div>
+      
+      <div class="grid-2" style="margin-bottom:20px;">
+        <div class="card">
+          <h3 style="margin-bottom:12px; color:var(--red);">&#9888; DNS Threat Queries</h3>
+          <div id="dnsThreatCount" style="font-size:32px; font-weight:700;">0</div>
+          <p style="font-size:12px; color:var(--dim);">High-threat DNS queries detected</p>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px; color:var(--orange);">&#128274; JA3 Malware Matches</h3>
+          <div id="ja3MalwareCount" style="font-size:32px; font-weight:700;">0</div>
+          <p style="font-size:12px; color:var(--dim);">Known malware TLS fingerprints</p>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px; color:var(--red);">&#128163; MITM/ARP Spoofing</h3>
+          <div id="mitmAttackCount" style="font-size:32px; font-weight:700;">0</div>
+          <p style="font-size:12px; color:var(--dim);">ARP spoofing attempts detected</p>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px; color:var(--accent);">&#128200; Total DNS Queries</h3>
+          <div id="totalDnsQueries" style="font-size:32px; font-weight:700;">0</div>
+          <p style="font-size:12px; color:var(--dim);">All DNS queries logged</p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <h3 style="margin-bottom:12px;">&#128269; Real-time DNS Queries (Threat Score &gt; 20)</h3>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; font-size:13px;">
+            <thead><tr><th>Time</th><th>Source IP</th><th>Query</th><th>Type</th><th>Threat Score</th><th>Category</th></tr></thead>
+            <tbody id="dnsQueriesTable"></tbody>
+          </table>
+        </div>
+        <div id="dnsQueriesEmpty" style="text-align:center; padding:20px; color:var(--dim);">No suspicious DNS queries detected</div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <h3 style="margin-bottom:12px;">&#128273; JA3 TLS Fingerprints (Suspicious)</h3>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; font-size:13px;">
+            <thead><tr><th>Time</th><th>Source IP</th><th>JA3 Hash</th><th>Matched Malware</th><th>Status</th></tr></thead>
+            <tbody id="ja3Table"></tbody>
+          </table>
+        </div>
+        <div id="ja3Empty" style="text-align:center; padding:20px; color:var(--dim);">No suspicious JA3 fingerprints detected</div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-bottom:12px; color:var(--red);">&#9888; MITM/ARP Spoofing Alerts</h3>
+        <div id="mitmAlertsList"></div>
+        <div id="mitmEmpty" style="text-align:center; padding:20px; color:var(--dim);">No MITM attacks detected</div>
       </div>
     </div>
 
