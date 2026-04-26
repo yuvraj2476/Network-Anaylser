@@ -1698,15 +1698,12 @@ def process_dns_query(packet, source_ip, source_mac):
         # Extract base domain (e.g., www.google.com -> google.com)
         base_domain = '.'.join(query_name.split('.')[-2:]) if len(query_name.split('.')) > 1 else query_name
         conn.execute("""
-            INSERT OR IGNORE INTO passive_dns_log (timestamp, source_mac, source_ip, domain)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO passive_dns_log (timestamp, source_mac, source_ip, domain, visit_count)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(source_mac, domain) DO UPDATE SET
+                visit_count = visit_count + 1,
+                timestamp = excluded.timestamp
         """, (dns_entry["timestamp"], source_mac, source_ip, base_domain))
-        
-        # Update visit count
-        conn.execute("""
-            UPDATE passive_dns_log SET visit_count = visit_count + 1, timestamp = ?
-            WHERE source_mac = ? AND domain = ?
-        """, (dns_entry["timestamp"], source_mac, base_domain))
         
         conn.commit()
         conn.close()
@@ -2180,7 +2177,7 @@ def check_security_events(devices):
             # Check for MAC address changes (possible MAC spoofing):
             # Look for a different device that previously held the same IP
             prev_owner = c.execute(
-                "SELECT * FROM devices WHERE ip = ? AND mac != ?", (dev["ip"], dev["mac"])
+                "SELECT mac FROM devices WHERE ip = ? AND mac != ?", (dev["ip"], dev["mac"])
             ).fetchone()
             if prev_owner:
                 c.execute(
