@@ -41,6 +41,17 @@ A powerful real-time network scanner and management dashboard for your home WiFi
 - **Parental Controls** — Schedule-based device blocking rules
 - **WiFi Info** — SSID, signal strength, channel, security
 - **Export** — Download device list as CSV or JSON
+- **OS Fingerprinting** — Guess device OS (Windows/macOS/Linux/iOS/Android) from TTL, TCP window, DHCP hostname
+- **Live Traffic Viewer** — Real-time HTTP hostnames, DNS queries, TLS SNI (no decryption)
+- **MITM Attack Simulator** — Educational ARP spoofing per-device with optional DNS spoof (phishing lab)
+- **DNS Spoof Simulator** — Redirect domains to fake IPs for phishing awareness training
+- **Rogue DHCP Detector** — Detect evil twin DHCP servers on your network
+- **Passive DNS Logger** — Track "Top 5 sites" visited per device
+- **TLS Fingerprinting (JA3)** — Detect malware by TLS client fingerprint without decryption
+- **MITM/ARP Spoof Detector** — Real-time alerts for ARP poisoning attacks
+- **Port Scan History** — Track new open ports over time to catch backdoors
+- **Bandwidth Hog Alerts** — Alert when a device uses >80% bandwidth for 5 minutes
+- **Audit Logging** — Every block/unblock/MITM action logged with timestamp and user
 
 ## Setup
 
