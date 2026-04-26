@@ -4,6 +4,11 @@ Network Manager Dashboard
 A real network scanner and management tool for your home WiFi.
 Run with: sudo python3 network_manager.py
 Dashboard: http://localhost:5000
+
+SECURITY FEATURES:
+- Authentication required (default: admin/admin123)
+- Rate limiting on port scans
+- Audit logging for all block/unblock actions
 """
 
 import os
@@ -18,10 +23,13 @@ import subprocess
 import platform
 import csv
 import io
+import queue
 from datetime import datetime, timedelta
 from collections import defaultdict
+from functools import wraps
 
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 import psutil
 
 # Optional imports for vulnerability scanning — graceful fallback
@@ -78,10 +86,97 @@ APP_PORT = 5000
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "network_manager.db")
 SCAN_INTERVAL = 30  # seconds between auto-scans
 
+# Security config - CHANGE THESE IN PRODUCTION!
+SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-in-production-abc123xyz")
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+# Rate limiting config
+MAX_SCAN_QUEUE_SIZE = 10  # Max pending scans
+SCAN_RATE_LIMIT = 5  # Max scans per minute per IP
+
 # ============================================================
 # FLASK APP
 # ============================================================
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# ============================================================
+# LOGIN MANAGER
+# ============================================================
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+login_manager.login_message = "Please log in to access the dashboard."
+
+
+# ============================================================
+# USER CLASS FOR FLASK-LOGIN
+# ============================================================
+class User(UserMixin):
+    """Simple user class for authentication."""
+    def __init__(self, username):
+        self.id = username
+        self.username = username
+
+# Hardcoded admin user - for v1 only!
+admin_user = User(DEFAULT_USERNAME)
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    """Load user by ID."""
+    if user_id == DEFAULT_USERNAME:
+        return admin_user
+    return None
+
+
+# ============================================================
+# RATE LIMITING & SCAN QUEUE
+# ============================================================
+scan_queue = queue.Queue(maxsize=MAX_SCAN_QUEUE_SIZE)
+scan_timestamps = defaultdict(list)  # Track scan times per IP
+
+
+def check_rate_limit(ip_address):
+    """Check if IP is within rate limit for scans."""
+    now = time.time()
+    # Clean old timestamps (older than 1 minute)
+    scan_timestamps[ip_address] = [t for t in scan_timestamps[ip_address] if now - t < 60]
+    
+    if len(scan_timestamps[ip_address]) >= SCAN_RATE_LIMIT:
+        return False
+    return True
+
+
+def record_scan(ip_address):
+    """Record a scan timestamp for rate limiting."""
+    scan_timestamps[ip_address].append(time.time())
+
+
+def add_scan_to_queue(scan_func, *args, **kwargs):
+    """Add a scan to the queue with rate limiting."""
+    if scan_queue.full():
+        return False, "Scan queue full. Please wait."
+    
+    try:
+        scan_queue.put((scan_func, args, kwargs), block=False)
+        return True, "Scan queued"
+    except queue.Full:
+        return False, "Scan queue full. Please wait."
+
+
+def scan_worker():
+    """Background worker to process scan queue."""
+    while True:
+        try:
+            scan_func, args, kwargs = scan_queue.get(timeout=1)
+            scan_func(*args, **kwargs)
+            scan_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[!] Scan error: {e}")
 
 
 # ============================================================
@@ -142,6 +237,19 @@ def init_db():
             devices_found INTEGER,
             new_devices INTEGER,
             scan_duration REAL
+        )
+    """)
+    # AUDIT LOG TABLE - tracks all security actions
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            action_type TEXT NOT NULL,
+            device_mac TEXT,
+            device_ip TEXT,
+            user TEXT,
+            details TEXT,
+            success INTEGER DEFAULT 1
         )
     """)
     conn.commit()
@@ -1135,6 +1243,11 @@ def background_scanner():
     """Background thread that periodically scans the network."""
     global scanner_running
     scanner_running = True
+    
+    # Start the scan queue worker
+    worker_thread = threading.Thread(target=scan_worker, daemon=True)
+    worker_thread.start()
+    
     while scanner_running:
         try:
             start = time.time()
@@ -1266,18 +1379,64 @@ def generate_security_report():
 # ============================================================
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Login page."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        
+        if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+            user = User(username)
+            login_user(user)
+            flash("Logged in successfully!", "success")
+            next_page = request.args.get("next")
+            return redirect(next_page or url_for("dashboard"))
+        else:
+            flash("Invalid username or password", "error")
+    
+    return render_template("login.html")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    """Logout endpoint."""
+    logout_user()
+    flash("You have been logged out.", "info")
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def dashboard():
     return render_template("dashboard.html")
 
 
 @app.route("/api/scan", methods=["POST"])
+@login_required
 def api_scan():
     """Trigger a manual network scan."""
     start = time.time()
     devices = arp_scan()
     new_count = update_devices_db(devices)
     duration = time.time() - start
+    
+    # Log the scan action
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, user, details, success)
+        VALUES (?, 'manual_scan', ?, ?, 1)
+    """,
+        (datetime.now().isoformat(), current_user.username, f"Scan completed in {duration:.2f}s"),
+    )
+    conn.commit()
+    conn.close()
+    
     return jsonify(
         {
             "success": True,
@@ -1289,6 +1448,7 @@ def api_scan():
 
 
 @app.route("/api/devices")
+@login_required
 def api_devices():
     """Get all known devices."""
     conn = get_db()
@@ -1300,6 +1460,7 @@ def api_devices():
 
 
 @app.route("/api/devices/<mac>", methods=["PUT"])
+@login_required
 def api_update_device(mac):
     """Update device info (custom name, type, notes, known status)."""
     data = request.json
@@ -1319,16 +1480,35 @@ def api_update_device(mac):
 
 
 @app.route("/api/devices/<mac>/block", methods=["POST"])
+@login_required
 def api_block_device(mac):
-    """Block a device."""
+    """Block a device - with audit logging."""
+    client_ip = request.remote_addr
+    
+    # Check rate limit
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+    
+    record_scan(client_ip)
+    
     conn = get_db()
-    device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+    device = conn.execute("SELECT ip, hostname FROM devices WHERE mac = ?", (mac,)).fetchone()
     if not device:
         conn.close()
         return jsonify({"success": False, "error": "Device not found"}), 404
 
     gateway = get_default_gateway()
     success, msg = block_device(device["ip"], gateway)
+    
+    # AUDIT LOG - always log block attempts
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success)
+        VALUES (?, 'block_device', ?, ?, ?, ?, ?)
+    """,
+        (datetime.now().isoformat(), mac, device["ip"], current_user.username, msg, 1 if success else 0),
+    )
+    
     if success:
         conn.execute("UPDATE devices SET is_blocked = 1 WHERE mac = ?", (mac,))
         conn.execute(
@@ -1338,25 +1518,44 @@ def api_block_device(mac):
         """,
             (datetime.now().isoformat(), f"Device {device['ip']} blocked", mac),
         )
-        conn.commit()
+    conn.commit()
     conn.close()
     return jsonify({"success": success, "message": msg})
 
 
 @app.route("/api/devices/<mac>/unblock", methods=["POST"])
+@login_required
 def api_unblock_device(mac):
-    """Unblock a device."""
+    """Unblock a device - with audit logging."""
+    client_ip = request.remote_addr
+    
+    # Check rate limit
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+    
+    record_scan(client_ip)
+    
     conn = get_db()
-    device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+    device = conn.execute("SELECT ip, hostname FROM devices WHERE mac = ?", (mac,)).fetchone()
     if not device:
         conn.close()
         return jsonify({"success": False, "error": "Device not found"}), 404
 
     gateway = get_default_gateway()
     success, msg = unblock_device(device["ip"], gateway)
+    
+    # AUDIT LOG - always log unblock attempts
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success)
+        VALUES (?, 'unblock_device', ?, ?, ?, ?, ?)
+    """,
+        (datetime.now().isoformat(), mac, device["ip"], current_user.username, msg, 1 if success else 0),
+    )
+    
     if success:
         conn.execute("UPDATE devices SET is_blocked = 0 WHERE mac = ?", (mac,))
-        conn.commit()
+    conn.commit()
     conn.close()
     return jsonify({"success": success, "message": msg})
 
@@ -1380,8 +1579,15 @@ def api_send_message(mac):
 
 
 @app.route("/api/devices/<mac>/portscan", methods=["POST"])
+@login_required
 def api_port_scan(mac):
-    """Run a port scan on a device."""
+    """Run a port scan on a device - with rate limiting and queue."""
+    client_ip = request.remote_addr
+    
+    # Check rate limit for scans
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+    
     data = request.json or {}
     port_range = data.get("range", "1-1024")
 
@@ -1391,32 +1597,84 @@ def api_port_scan(mac):
     if not device:
         return jsonify({"success": False, "error": "Device not found"}), 404
 
-    ports = scan_ports(device["ip"], port_range)
-    return jsonify({"success": True, "ip": device["ip"], "ports": ports})
+    # Use queue for port scans to prevent flooding
+    result_queue = queue.Queue()
+    
+    def do_scan():
+        ports = scan_ports(device["ip"], port_range)
+        result_queue.put(ports)
+    
+    success, msg = add_scan_to_queue(do_scan)
+    if not success:
+        return jsonify({"success": False, "error": msg}), 503
+    
+    # Wait for result (with timeout)
+    try:
+        ports = result_queue.get(timeout=30)
+        record_scan(client_ip)
+        
+        # Log the scan
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success)
+            VALUES (?, 'port_scan', ?, ?, ?, ?, 1)
+        """,
+            (datetime.now().isoformat(), mac, device["ip"], current_user.username, f"Port range: {port_range}"),
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"success": True, "ip": device["ip"], "ports": ports})
+    except queue.Empty:
+        return jsonify({"success": False, "error": "Scan timed out"}), 504
 
 
 @app.route("/api/devices/<mac>/vulnscan", methods=["POST"])
+@login_required
 def api_vulnerability_scan(mac):
-    """Run a vulnerability scan on a device."""
+    """Run a vulnerability scan on a device - with rate limiting."""
+    client_ip = request.remote_addr
+    
+    # Check rate limit
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+    
     conn = get_db()
     device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
     conn.close()
     if not device:
         return jsonify({"success": False, "error": "Device not found"}), 404
 
+    record_scan(client_ip)
     vulnerabilities = vulnerability_scan(device["ip"])
+    
+    # Log the scan
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success)
+        VALUES (?, 'vuln_scan', ?, ?, ?, ?, 1)
+    """,
+        (datetime.now().isoformat(), mac, device["ip"], current_user.username, f"Found {len(vulnerabilities)} issues"),
+    )
+    conn.commit()
+    conn.close()
+    
     return jsonify(
         {"success": True, "ip": device["ip"], "vulnerabilities": vulnerabilities}
     )
 
 
 @app.route("/api/wifi")
+@login_required
 def api_wifi():
     """Get WiFi information."""
     return jsonify(get_wifi_info())
 
 
 @app.route("/api/wifi/security")
+@login_required
 def api_wifi_security():
     """Get WiFi security information."""
     security_info = wifi_security_scan()
@@ -1425,19 +1683,35 @@ def api_wifi_security():
 
 
 @app.route("/api/bandwidth")
+@login_required
 def api_bandwidth():
     """Get current bandwidth usage."""
     return jsonify(get_bandwidth())
 
 
 @app.route("/api/speedtest", methods=["POST"])
+@login_required
 def api_speedtest():
     """Run speed test."""
     result = run_speed_test()
+    
+    # Log the action
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, user, details, success)
+        VALUES (?, 'speedtest', ?, ?, 1)
+    """,
+        (datetime.now().isoformat(), current_user.username, "Speed test completed"),
+    )
+    conn.commit()
+    conn.close()
+    
     return jsonify(result)
 
 
 @app.route("/api/packet-capture/start", methods=["POST"])
+@login_required
 def api_start_packet_capture():
     """Start packet capture."""
     data = request.json or {}
@@ -1446,17 +1720,47 @@ def api_start_packet_capture():
     count = data.get("count", 0)
 
     success, message = start_packet_capture(interface, filter_str, count)
+    
+    # Log the action
+    if success:
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT INTO audit_log (timestamp, action_type, user, details, success)
+            VALUES (?, 'packet_capture_start', ?, ?, 1)
+        """,
+            (datetime.now().isoformat(), current_user.username, f"Interface: {interface}, Filter: {filter_str}"),
+        )
+        conn.commit()
+        conn.close()
+    
     return jsonify({"success": success, "message": message})
 
 
 @app.route("/api/packet-capture/stop", methods=["POST"])
+@login_required
 def api_stop_packet_capture():
     """Stop packet capture."""
     success, message = stop_packet_capture()
+    
+    # Log the action
+    if success:
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT INTO audit_log (timestamp, action_type, user, details, success)
+            VALUES (?, 'packet_capture_stop', ?, ?, 1)
+        """,
+            (datetime.now().isoformat(), current_user.username, "Packet capture stopped"),
+        )
+        conn.commit()
+        conn.close()
+    
     return jsonify({"success": success, "message": message})
 
 
 @app.route("/api/packet-capture/clear", methods=["POST"])
+@login_required
 def api_clear_packet_capture():
     """Clear captured packets."""
     success, message = clear_captured_packets()
@@ -1464,6 +1768,7 @@ def api_clear_packet_capture():
 
 
 @app.route("/api/packet-capture/data")
+@login_required
 def api_get_packet_capture_data():
     """Get captured packet data."""
     limit = request.args.get("limit", 100, type=int)
@@ -1472,6 +1777,7 @@ def api_get_packet_capture_data():
 
 
 @app.route("/api/alerts")
+@login_required
 def api_alerts():
     """Get alerts."""
     conn = get_db()
@@ -1483,6 +1789,7 @@ def api_alerts():
 
 
 @app.route("/api/alerts/read", methods=["POST"])
+@login_required
 def api_mark_alerts_read():
     """Mark all alerts as read."""
     conn = get_db()
@@ -1492,7 +1799,30 @@ def api_mark_alerts_read():
     return jsonify({"success": True})
 
 
+@app.route("/api/audit-log")
+@login_required
+def api_audit_log():
+    """Get audit log entries."""
+    conn = get_db()
+    limit = request.args.get("limit", 100, type=int)
+    action_type = request.args.get("action_type")
+    
+    if action_type:
+        entries = conn.execute(
+            "SELECT * FROM audit_log WHERE action_type = ? ORDER BY timestamp DESC LIMIT ?",
+            (action_type, limit)
+        ).fetchall()
+    else:
+        entries = conn.execute(
+            "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return jsonify([dict(e) for e in entries])
+
+
 @app.route("/api/stats")
+@login_required
 def api_stats():
     """Get dashboard statistics."""
     conn = get_db()
@@ -1529,6 +1859,7 @@ def api_stats():
 
 
 @app.route("/api/network-info")
+@login_required
 def api_network_info():
     """Get comprehensive network info."""
     interfaces = {}
@@ -1558,6 +1889,7 @@ def api_network_info():
 
 
 @app.route("/api/parental-rules", methods=["GET"])
+@login_required
 def api_get_parental_rules():
     """Get parental control rules."""
     conn = get_db()
@@ -1567,6 +1899,7 @@ def api_get_parental_rules():
 
 
 @app.route("/api/parental-rules", methods=["POST"])
+@login_required
 def api_add_parental_rule():
     """Add a parental control rule."""
     data = request.json
@@ -1584,22 +1917,44 @@ def api_add_parental_rule():
             data.get("action", "block"),
         ),
     )
+    
+    # Log the action
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, user, details, success)
+        VALUES (?, 'parental_rule_add', ?, ?, 1)
+    """,
+        (datetime.now().isoformat(), current_user.username, f"Rule for {data['device_mac']}"),
+    )
+    
     conn.commit()
     conn.close()
     return jsonify({"success": True})
 
 
 @app.route("/api/parental-rules/<int:rule_id>", methods=["DELETE"])
+@login_required
 def api_delete_parental_rule(rule_id):
     """Delete a parental control rule."""
     conn = get_db()
     conn.execute("DELETE FROM parental_rules WHERE id = ?", (rule_id,))
+    
+    # Log the action
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, action_type, user, details, success)
+        VALUES (?, 'parental_rule_delete', ?, ?, 1)
+    """,
+        (datetime.now().isoformat(), current_user.username, f"Rule ID: {rule_id}"),
+    )
+    
     conn.commit()
     conn.close()
     return jsonify({"success": True})
 
 
 @app.route("/api/security-report")
+@login_required
 def api_security_report():
     """Generate and return a security report."""
     report = generate_security_report()
@@ -1607,6 +1962,7 @@ def api_security_report():
 
 
 @app.route("/api/export/<fmt>")
+@login_required
 def api_export(fmt):
     """Export device list."""
     conn = get_db()
@@ -1660,6 +2016,7 @@ def api_export(fmt):
 
 
 @app.route("/api/bandwidth-history")
+@login_required
 def api_bandwidth_history():
     """Get bandwidth history for charts."""
     conn = get_db()
