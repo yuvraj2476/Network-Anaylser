@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  network-analyzer:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      # Persist database between runs
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/network_manager.db
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    restart: unless-stopped
