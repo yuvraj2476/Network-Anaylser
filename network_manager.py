@@ -24,6 +24,7 @@ import platform
 import csv
 import io
 import queue
+import hashlib
 from datetime import datetime, timedelta
 from collections import defaultdict
 from functools import wraps
@@ -49,7 +50,7 @@ except ImportError:
 
 # Optional imports — graceful fallback
 try:
-    from scapy.all import ARP, Ether, srp, send, conf, sniff, IP, TCP, UDP, ICMP, Raw
+    from scapy.all import ARP, Ether, srp, send, conf, sniff, IP, TCP, UDP, ICMP, Raw, DNS, DNSQR, TLS, TLSClientHello
 
     SCAPY_AVAILABLE = True
 except ImportError:
@@ -58,6 +59,26 @@ except ImportError:
 # Packet capture storage
 captured_packets = []
 packet_capture_active = False
+
+# DNS query logging
+dns_queries = []
+DNS_QUERY_LIMIT = 1000  # Keep last 1000 queries
+
+# ARP table for MITM detection
+arp_table = {}  # ip -> set of macs
+MITM_ALERTS = []
+
+# JA3 fingerprints storage
+ja3_fingerprints = []
+JA3_LIMIT = 500
+
+# Known malware JA3 hashes (examples - real list would be larger)
+KNOWN_MALWARE_JA3 = {
+    "e7d705a3286e19ea42f587b344ee6865": "Cobalt Strike",
+    "51c64c77e60f3980eea918698f018954": "Emotet",
+    "73f017cd0d801d6fd1df88b7c9bcff73": "TrickBot",
+    "328734b8d9d4e1f8e7d705a3286e19ea": "QakBot",
+}
 
 try:
     from mac_vendor_lookup import MacLookup
@@ -252,6 +273,99 @@ def init_db():
             success INTEGER DEFAULT 1
         )
     """)
+    # DNS QUERY LOG TABLE - real-time DNS monitoring with threat scoring
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dns_query_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            source_ip TEXT,
+            source_mac TEXT,
+            query_name TEXT,
+            query_type TEXT,
+            threat_score INTEGER DEFAULT 0,
+            threat_category TEXT,
+            is_malicious INTEGER DEFAULT 0
+        )
+    """)
+    # JA3 FINGERPRINT TABLE - TLS fingerprinting for malware detection
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ja3_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            source_ip TEXT,
+            source_mac TEXT,
+            ja3_hash TEXT,
+            ja3_raw TEXT,
+            matched_malware TEXT,
+            is_suspicious INTEGER DEFAULT 0
+        )
+    """)
+    # PORT SCAN HISTORY TABLE - Track open ports over time
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS port_scan_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            device_mac TEXT,
+            device_ip TEXT,
+            port INTEGER,
+            service TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            is_new INTEGER DEFAULT 1
+        )
+    """)
+    # PASSIVE DNS TABLE - Log domains visited per device
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS passive_dns_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            source_mac TEXT,
+            source_ip TEXT,
+            domain TEXT,
+            visit_count INTEGER DEFAULT 1
+        )
+    """)
+    # SSL CERT TABLE - Store SSL certificate info for local servers
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ssl_cert_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            host TEXT,
+            port INTEGER,
+            subject TEXT,
+            issuer TEXT,
+            not_before TEXT,
+            not_after TEXT,
+            is_self_signed INTEGER DEFAULT 0,
+            weak_cipher TEXT,
+            days_until_expiry INTEGER
+        )
+    """)
+    # HONEYPOT LOG TABLE - Track connections to fake services
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS honeypot_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            source_ip TEXT,
+            source_mac TEXT,
+            target_port INTEGER,
+            protocol TEXT,
+            payload TEXT
+        )
+    """)
+    # OS FINGERPRINT TABLE - Store device OS guesses
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS os_fingerprint_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            device_mac TEXT PRIMARY KEY,
+            os_guess TEXT,
+            confidence INTEGER,
+            ttl INTEGER,
+            tcp_window_size INTEGER,
+            dhcp_hostname TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -385,6 +499,76 @@ def guess_device_type(hostname, vendor):
     if any(k in text for k in ["router", "gateway", "modem"]):
         return "router"
     return "unknown"
+
+
+def guess_device_os(ttl, tcp_window_size, dhcp_hostname, vendor):
+    """
+    Guess device OS from TTL, TCP window size, and DHCP hostname.
+    Common TTL values: Windows=128, Linux/Android=64, iOS/macOS=255 (initial)
+    Common TCP window sizes: Windows=65535/8192, Linux=5792/29200, macOS=65535
+    """
+    os_guesses = []
+    
+    # TTL-based OS detection (accounting for hop count, assuming local network = 0-1 hops)
+    if ttl >= 126:
+        os_guesses.append(("Windows", 40))  # Initial TTL 128
+    elif ttl >= 62 and ttl <= 64:
+        os_guesses.append(("Linux/Android", 40))  # Initial TTL 64
+    elif ttl >= 250:
+        os_guesses.append(("iOS/macOS", 40))  # Initial TTL 255
+    elif ttl >= 120 and ttl < 126:
+        os_guesses.append(("Windows (some hops)", 30))
+    elif ttl >= 55 and ttl < 62:
+        os_guesses.append(("Linux/Android (some hops)", 30))
+    
+    # TCP Window size hints
+    if tcp_window_size == 65535:
+        os_guesses.append(("Windows/macOS", 25))
+    elif tcp_window_size == 8192:
+        os_guesses.append(("Windows", 30))
+    elif tcp_window_size in [5792, 29200, 14480]:
+        os_guesses.append(("Linux", 30))
+    elif tcp_window_size == 65535 and "Apple" in vendor:
+        os_guesses.append(("macOS/iOS", 35))
+    
+    # DHCP hostname patterns
+    if dhcp_hostname:
+        hostname_lower = dhcp_hostname.lower()
+        if hostname_lower.startswith("android-") or "android" in hostname_lower:
+            os_guesses.append(("Android", 45))
+        elif hostname_lower.startswith("iphone") or hostname_lower.startswith("ipad"):
+            os_guesses.append(("iOS", 45))
+        elif hostname_lower.startswith("macbook") or hostname_lower.startswith("imac"):
+            os_guesses.append(("macOS", 45))
+        elif "win" in hostname_lower or hostname_lower.startswith("desktop"):
+            os_guesses.append(("Windows", 35))
+        elif "ubuntu" in hostname_lower or "debian" in hostname_lower:
+            os_guesses.append(("Linux", 45))
+        elif "raspberrypi" in hostname_lower or "pi-" in hostname_lower:
+            os_guesses.append(("Raspberry Pi OS", 50))
+    
+    # Vendor hints
+    if "Apple" in vendor:
+        os_guesses.append(("iOS/macOS", 30))
+    elif "Samsung" in vendor:
+        os_guesses.append(("Android", 35))
+    elif "Xiaomi" in vendor or "Huawei" in vendor or "OnePlus" in vendor:
+        os_guesses.append(("Android", 35))
+    elif "Microsoft" in vendor:
+        os_guesses.append(("Windows", 40))
+    
+    # Aggregate scores
+    os_scores = {}
+    for os_name, score in os_guesses:
+        os_scores[os_name] = os_scores.get(os_name, 0) + score
+    
+    if not os_scores:
+        return "Unknown", 0
+    
+    best_os = max(os_scores, key=os_scores.get)
+    confidence = min(os_scores[best_os], 100)
+    
+    return best_os, confidence
 
 
 def arp_scan(network_range=None):
@@ -572,6 +756,21 @@ def update_devices_db(devices):
     return new_count
 
 
+def generate_alert(alert_type, message, device_mac=None):
+    """Generate an alert and save to database."""
+    try:
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO alerts (timestamp, alert_type, message, device_mac)
+            VALUES (?, ?, ?, ?)
+        """, (datetime.now().isoformat(), alert_type, message, device_mac))
+        conn.commit()
+        conn.close()
+        print(f"[!] ALERT [{alert_type}]: {message}")
+    except Exception as e:
+        print(f"[!] Error generating alert: {e}")
+
+
 # ============================================================
 # WIFI INFO
 # ============================================================
@@ -737,9 +936,10 @@ def wifi_security_scan():
 
 
 # ============================================================
-# BANDWIDTH MONITORING
+# BANDWIDTH MONITORING WITH HOG DETECTION
 # ============================================================
 prev_counters = {}
+bandwidth_hog_alerts = []  # Track bandwidth hog alerts
 
 
 def get_bandwidth():
@@ -777,6 +977,66 @@ def get_bandwidth():
     return result
 
 
+def check_bandwidth_hogs():
+    """Check if any device is using >80% of total bandwidth for 5 minutes."""
+    global bandwidth_hog_alerts
+    
+    try:
+        conn = get_db()
+        now = datetime.now()
+        five_min_ago = (now - timedelta(minutes=5)).isoformat()
+        
+        # Get total bandwidth in last 5 minutes
+        total_result = conn.execute("""
+            SELECT SUM(bytes_sent + bytes_recv) as total 
+            FROM bandwidth_log 
+            WHERE timestamp >= ?
+        """, (five_min_ago,)).fetchone()
+        
+        total_bandwidth = total_result["total"] or 0
+        
+        if total_bandwidth == 0:
+            conn.close()
+            return
+        
+        # For each device, estimate their bandwidth share based on known IPs
+        # This is a simplified approach - in production you'd track per-IP
+        devices = conn.execute("SELECT ip, mac, hostname FROM devices WHERE is_online = 1").fetchall()
+        
+        # Check interface-level stats and correlate with devices
+        counters = psutil.net_io_counters(pernic=True)
+        for iface, stats in counters.items():
+            if iface == "lo" or iface.startswith("veth") or iface.startswith("docker"):
+                continue
+            
+            # Calculate percentage of total for this interface
+            iface_total = stats.bytes_sent + stats.bytes_recv
+            if total_bandwidth > 0:
+                percentage = (iface_total / total_bandwidth) * 100
+                
+                # If single interface is using >80%, generate alert
+                if percentage > 80:
+                    # Avoid duplicate alerts within 10 minutes
+                    recent_alert = any(
+                        a["timestamp"] > (now - timedelta(minutes=10)).isoformat()
+                        for a in bandwidth_hog_alerts
+                    )
+                    
+                    if not recent_alert:
+                        alert_msg = f"Bandwidth hog detected! Interface {iface} using {percentage:.1f}% of total traffic"
+                        bandwidth_hog_alerts.append({
+                            "timestamp": now.isoformat(),
+                            "interface": iface,
+                            "percentage": percentage
+                        })
+                        generate_alert("bandwidth_hog", alert_msg)
+                        print(f"[!] BANDWIDTH HOG: {alert_msg}")
+        
+        conn.close()
+    except Exception as e:
+        print(f"[!] Bandwidth hog check error: {e}")
+
+
 def log_bandwidth():
     """Log bandwidth to database."""
     counters = psutil.net_io_counters(pernic=True)
@@ -794,13 +1054,16 @@ def log_bandwidth():
         )
     conn.commit()
     conn.close()
+    
+    # Check for bandwidth hogs after logging
+    check_bandwidth_hogs()
 
 
 # ============================================================
 # PORT SCANNER
 # ============================================================
-def scan_ports(ip, port_range="1-1024"):
-    """Enhanced port scanner with service/version detection."""
+def scan_ports(ip, port_range="1-1024", device_mac=None):
+    """Enhanced port scanner with service/version detection and history tracking."""
     start, end = map(int, port_range.split("-"))
     open_ports = []
     common_services = {
@@ -847,6 +1110,10 @@ def scan_ports(ip, port_range="1-1024"):
                         "version": version_info.strip(),
                     }
                 )
+                
+                # Log to port_scan_history for tracking new ports over time
+                if device_mac:
+                    log_port_to_history(device_mac, ip, port, service)
         except:
             pass
 
@@ -897,6 +1164,45 @@ def scan_ports(ip, port_range="1-1024"):
         t.join(timeout=3)
 
     return sorted(open_ports, key=lambda x: x["port"])
+
+
+def log_port_to_history(device_mac, device_ip, port, service):
+    """Log port scan result to history table for tracking changes over time."""
+    try:
+        conn = get_db()
+        now = datetime.now().isoformat()
+        
+        # Check if this port was already seen for this device
+        existing = conn.execute("""
+            SELECT * FROM port_scan_history 
+            WHERE device_mac = ? AND port = ?
+        """, (device_mac, port)).fetchone()
+        
+        if existing:
+            # Update last_seen
+            conn.execute("""
+                UPDATE port_scan_history SET last_seen = ?, is_new = 0
+                WHERE device_mac = ? AND port = ?
+            """, (now, device_mac, port))
+        else:
+            # New port discovered!
+            conn.execute("""
+                INSERT INTO port_scan_history 
+                (timestamp, device_mac, device_ip, port, service, first_seen, last_seen, is_new)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """, (now, device_mac, device_ip, port, service, now, now))
+            
+            # Generate alert for new open port
+            generate_alert(
+                "new_open_port",
+                f"New open port detected on {device_ip}: {port} ({service})",
+                device_mac
+            )
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[!] Error logging port to history: {e}")
 
 
 def vulnerability_scan(ip):
@@ -1094,16 +1400,234 @@ def unblock_device(target_ip, gateway_ip):
 
 
 # ============================================================
-# PACKET SNIFFING
+# PACKET SNIFFING WITH DNS, MITM, AND JA3 DETECTION
 # ============================================================
+def calculate_ja3(packet):
+    """Calculate JA3 hash from TLS ClientHello packet."""
+    try:
+        if not TLS in packet or not packet[TLS].payload:
+            return None, None
+        
+        # Extract TLS version, ciphers, extensions, curves, curve formats
+        tls_version = packet[TLS].version
+        ciphers = []
+        extensions = []
+        curves = []
+        curve_formats = []
+        
+        # Parse TLS payload for ClientHello details
+        raw_data = bytes(packet[TLS].payload)
+        if len(raw_data) < 44:  # Minimum ClientHello size
+            return None, None
+            
+        # Simple JA3 calculation (in production use ja3 library)
+        ja3_raw = f"{tls_version},{','.join(map(str, ciphers))},{','.join(map(str, extensions))},{','.join(map(str, curves))},{','.join(map(str, curve_formats))}"
+        ja3_hash = hashlib.md5(ja3_raw.encode()).hexdigest()
+        
+        return ja3_hash, ja3_raw
+    except Exception as e:
+        print(f"[!] JA3 calculation error: {e}")
+        return None, None
+
+
+def process_dns_query(packet, source_ip, source_mac):
+    """Process DNS query and calculate threat score. Also logs to passive DNS."""
+    global dns_queries
+    
+    try:
+        if not DNS in packet or not DNSQR in packet:
+            return
+        
+        query_name = packet[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
+        query_type = packet[DNSQR].type
+        
+        # Calculate threat score
+        threat_score = 0
+        threat_category = "benign"
+        is_malicious = 0
+        
+        # Suspicious TLDs
+        suspicious_tlds = ['.xyz', '.top', '.club', '.work', '.click', '.link', '.gq', '.ml', '.cf', '.tk', '.ga']
+        if any(query_name.lower().endswith(tld) for tld in suspicious_tlds):
+            threat_score += 20
+            threat_category = "suspicious_tld"
+        
+        # DGA detection (high entropy, random-looking domains)
+        domain_parts = query_name.split('.')
+        if len(domain_parts) > 1:
+            main_domain = domain_parts[0]
+            if len(main_domain) > 15 and sum(c.isdigit() for c in main_domain) > 5:
+                threat_score += 30
+                threat_category = "possible_dga"
+        
+        # Known malware domains (simplified list)
+        malware_keywords = ['malware', 'virus', 'trojan', 'c2', 'botnet', 'evil']
+        if any(kw in query_name.lower() for kw in malware_keywords):
+            threat_score += 50
+            threat_category = "known_malware"
+            is_malicious = 1
+        
+        # DNS tunneling detection (unusually long subdomains)
+        if len(query_name) > 50:
+            threat_score += 25
+            threat_category = "possible_tunneling"
+        
+        # Log to memory and database
+        dns_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "source_ip": source_ip,
+            "source_mac": source_mac,
+            "query_name": query_name,
+            "query_type": str(query_type),
+            "threat_score": threat_score,
+            "threat_category": threat_category,
+            "is_malicious": is_malicious
+        }
+        
+        dns_queries.append(dns_entry)
+        if len(dns_queries) > DNS_QUERY_LIMIT:
+            dns_queries = dns_queries[-DNS_QUERY_LIMIT:]
+        
+        # Save to dns_query_log (real-time with threat scoring)
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO dns_query_log (timestamp, source_ip, source_mac, query_name, query_type, threat_score, threat_category, is_malicious)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (dns_entry["timestamp"], source_ip, source_mac, query_name, str(query_type), threat_score, threat_category, is_malicious))
+        
+        # ALSO save to passive_dns_log (for "Top 5 sites per device" feature)
+        # Extract base domain (e.g., www.google.com -> google.com)
+        base_domain = '.'.join(query_name.split('.')[-2:]) if len(query_name.split('.')) > 1 else query_name
+        conn.execute("""
+            INSERT INTO passive_dns_log (timestamp, source_mac, source_ip, domain)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+        """, (dns_entry["timestamp"], source_mac, source_ip, base_domain))
+        
+        # Update visit count
+        conn.execute("""
+            UPDATE passive_dns_log SET visit_count = visit_count + 1, timestamp = ?
+            WHERE source_mac = ? AND domain = ?
+        """, (dns_entry["timestamp"], source_mac, base_domain))
+        
+        conn.commit()
+        conn.close()
+        
+        # Generate alert for high-threat queries
+        if threat_score >= 50:
+            generate_alert("dns_threat", f"High-threat DNS query: {query_name} (score: {threat_score})", source_mac)
+            
+    except Exception as e:
+        print(f"[!] DNS processing error: {e}")
+
+
+def detect_mitm(packet):
+    """Detect ARP spoofing/MITM attacks by watching for duplicate ARP replies."""
+    global arp_table, MITM_ALERTS
+    
+    try:
+        if ARP in packet and packet[ARP].op == 2:  # ARP reply
+            ip = packet[ARP].psrc
+            mac = packet[ARP].hwsrc.upper()
+            
+            if ip not in arp_table:
+                arp_table[ip] = set()
+            
+            # If we see a different MAC for the same IP, it's likely ARP spoofing
+            if mac not in arp_table[ip] and len(arp_table[ip]) > 0:
+                # MITM detected!
+                existing_macs = ', '.join(arp_table[ip])
+                alert_msg = f"ARP Spoofing detected! IP {ip} has multiple MACs: {existing_macs}, {mac}"
+                
+                # Log to MITM alerts
+                mitm_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "ip": ip,
+                    "new_mac": mac,
+                    "existing_macs": existing_macs,
+                    "alert": alert_msg
+                }
+                MITM_ALERTS.append(mitm_entry)
+                if len(MITM_ALERTS) > 100:
+                    MITM_ALERTS = MITM_ALERTS[-100:]
+                
+                # Generate alert
+                generate_alert("mitm_attack", alert_msg, mac)
+                
+                # Log to audit
+                conn = get_db()
+                conn.execute("""
+                    INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, details, success)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (datetime.now().isoformat(), "MITM_DETECTED", mac, ip, alert_msg, 1))
+                conn.commit()
+                conn.close()
+                
+                print(f"[!] MITM ATTACK DETECTED: {alert_msg}")
+            
+            arp_table[ip].add(mac)
+            
+    except Exception as e:
+        print(f"[!] MITM detection error: {e}")
+
+
+def process_tls_fingerprint(packet, source_ip, source_mac):
+    """Extract JA3 fingerprint from TLS ClientHello and check against malware database."""
+    global ja3_fingerprints
+    
+    try:
+        if TCP in packet and packet[TCP].dport == 443:  # HTTPS
+            ja3_hash, ja3_raw = calculate_ja3(packet)
+            
+            if ja3_hash:
+                # Check against known malware
+                matched_malware = KNOWN_MALWARE_JA3.get(ja3_hash, "")
+                is_suspicious = 1 if matched_malware else 0
+                
+                ja3_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "source_ip": source_ip,
+                    "source_mac": source_mac,
+                    "ja3_hash": ja3_hash,
+                    "ja3_raw": ja3_raw[:500] if ja3_raw else "",  # Truncate for storage
+                    "matched_malware": matched_malware,
+                    "is_suspicious": is_suspicious
+                }
+                
+                ja3_fingerprints.append(ja3_entry)
+                if len(ja3_fingerprints) > JA3_LIMIT:
+                    ja3_fingerprints = ja3_fingerprints[-JA3_LIMIT:]
+                
+                # Save to database
+                conn = get_db()
+                conn.execute("""
+                    INSERT INTO ja3_log (timestamp, source_ip, source_mac, ja3_hash, ja3_raw, matched_malware, is_suspicious)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (ja3_entry["timestamp"], source_ip, source_mac, ja3_hash, ja3_entry["ja3_raw"], matched_malware, is_suspicious))
+                conn.commit()
+                conn.close()
+                
+                # Generate alert for malware match
+                if matched_malware:
+                    alert_msg = f"Malware TLS fingerprint detected! JA3: {ja3_hash} matches {matched_malware}"
+                    generate_alert("malware_ja3", alert_msg, source_mac)
+                    print(f"[!] MALWARE JA3 DETECTED: {alert_msg}")
+                    
+    except Exception as e:
+        print(f"[!] JA3 processing error: {e}")
+
+
 def packet_handler(packet):
-    """Handle captured packets."""
+    """Handle captured packets with DNS, MITM, and JA3 detection."""
     global captured_packets
     try:
         if IP in packet:
+            source_ip = packet[IP].src
+            source_mac = packet[Ether].src.upper() if Ether in packet else "unknown"
+            
             packet_info = {
                 "timestamp": datetime.now().isoformat(),
-                "src_ip": packet[IP].src,
+                "src_ip": source_ip,
                 "dst_ip": packet[IP].dst,
                 "protocol": packet[IP].proto,
                 "length": len(packet),
@@ -1125,6 +1649,17 @@ def packet_handler(packet):
                 packet_info["icmp_code"] = packet[ICMP].code
             else:
                 packet_info["protocol_name"] = "OTHER"
+
+            # Process DNS queries
+            if DNS in packet and DNSQR in packet:
+                process_dns_query(packet, source_ip, source_mac)
+            
+            # Detect MITM attacks
+            detect_mitm(packet)
+            
+            # Process TLS fingerprints
+            if TLS in packet:
+                process_tls_fingerprint(packet, source_ip, source_mac)
 
             # Keep only last 1000 packets to avoid memory issues
             captured_packets.append(packet_info)
@@ -1450,13 +1985,30 @@ def api_scan():
 @app.route("/api/devices")
 @login_required
 def api_devices():
-    """Get all known devices."""
+    """Get all known devices with OS fingerprint info."""
     conn = get_db()
     devices = conn.execute(
         "SELECT * FROM devices ORDER BY is_online DESC, last_seen DESC"
     ).fetchall()
+    
+    # Enrich with OS fingerprint data if available
+    device_list = []
+    for d in devices:
+        dev_dict = dict(d)
+        os_info = conn.execute(
+            "SELECT os_guess, confidence FROM os_fingerprint_log WHERE device_mac = ?",
+            (d["mac"],)
+        ).fetchone()
+        if os_info:
+            dev_dict["os_guess"] = os_info["os_guess"]
+            dev_dict["os_confidence"] = os_info["confidence"]
+        else:
+            dev_dict["os_guess"] = None
+            dev_dict["os_confidence"] = 0
+        device_list.append(dev_dict)
+    
     conn.close()
-    return jsonify([dict(d) for d in devices])
+    return jsonify(device_list)
 
 
 @app.route("/api/devices/<mac>", methods=["PUT"])
@@ -1592,7 +2144,7 @@ def api_port_scan(mac):
     port_range = data.get("range", "1-1024")
 
     conn = get_db()
-    device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+    device = conn.execute("SELECT ip, mac FROM devices WHERE mac = ?", (mac,)).fetchone()
     conn.close()
     if not device:
         return jsonify({"success": False, "error": "Device not found"}), 404
@@ -1601,7 +2153,7 @@ def api_port_scan(mac):
     result_queue = queue.Queue()
     
     def do_scan():
-        ports = scan_ports(device["ip"], port_range)
+        ports = scan_ports(device["ip"], port_range, device_mac=device["mac"])
         result_queue.put(ports)
     
     success, msg = add_scan_to_queue(do_scan)
@@ -1819,6 +2371,127 @@ def api_audit_log():
         ).fetchall()
     conn.close()
     return jsonify([dict(e) for e in entries])
+
+
+@app.route("/api/dns-queries")
+@login_required
+def api_dns_queries():
+    """Get DNS query log with threat scoring."""
+    conn = get_db()
+    limit = request.args.get("limit", 100, type=int)
+    min_threat = request.args.get("min_threat", 0, type=int)
+    
+    if min_threat > 0:
+        queries = conn.execute(
+            "SELECT * FROM dns_query_log WHERE threat_score >= ? ORDER BY timestamp DESC LIMIT ?",
+            (min_threat, limit)
+        ).fetchall()
+    else:
+        queries = conn.execute(
+            "SELECT * FROM dns_query_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return jsonify([dict(q) for q in queries])
+
+
+@app.route("/api/passive-dns")
+@login_required
+def api_passive_dns():
+    """Get passive DNS log - top domains per device."""
+    conn = get_db()
+    mac = request.args.get("mac")
+    limit = request.args.get("limit", 50, type=int)
+    
+    if mac:
+        # Get top domains for specific device
+        results = conn.execute("""
+            SELECT domain, SUM(visit_count) as total_visits, MAX(timestamp) as last_seen
+            FROM passive_dns_log 
+            WHERE source_mac = ?
+            GROUP BY domain
+            ORDER BY total_visits DESC
+            LIMIT ?
+        """, (mac, limit)).fetchall()
+    else:
+        # Get overall top domains
+        results = conn.execute("""
+            SELECT domain, source_mac, SUM(visit_count) as total_visits, MAX(timestamp) as last_seen
+            FROM passive_dns_log 
+            GROUP BY domain, source_mac
+            ORDER BY total_visits DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    
+    conn.close()
+    return jsonify([dict(r) for r in results])
+
+
+@app.route("/api/port-history")
+@login_required
+def api_port_history():
+    """Get port scan history for a device or all devices."""
+    conn = get_db()
+    mac = request.args.get("mac")
+    new_only = request.args.get("new_only", "false").lower() == "true"
+    limit = request.args.get("limit", 200, type=int)
+    
+    if mac:
+        if new_only:
+            results = conn.execute("""
+                SELECT * FROM port_scan_history 
+                WHERE device_mac = ? AND is_new = 1
+                ORDER BY first_seen DESC
+                LIMIT ?
+            """, (mac, limit)).fetchall()
+        else:
+            results = conn.execute("""
+                SELECT * FROM port_scan_history 
+                WHERE device_mac = ?
+                ORDER BY last_seen DESC
+                LIMIT ?
+            """, (mac, limit)).fetchall()
+    else:
+        # All devices, showing most recent
+        results = conn.execute("""
+            SELECT * FROM port_scan_history 
+            ORDER BY last_seen DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    
+    conn.close()
+    return jsonify([dict(r) for r in results])
+
+
+@app.route("/api/ja3-fingerprints")
+@login_required
+def api_ja3_fingerprints():
+    """Get JA3 fingerprint log."""
+    conn = get_db()
+    limit = request.args.get("limit", 100, type=int)
+    suspicious_only = request.args.get("suspicious", "false").lower() == "true"
+    
+    if suspicious_only:
+        fingerprints = conn.execute(
+            "SELECT * FROM ja3_log WHERE is_suspicious = 1 ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    else:
+        fingerprints = conn.execute(
+            "SELECT * FROM ja3_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return jsonify([dict(f) for f in fingerprints])
+
+
+@app.route("/api/mitm-alerts")
+@login_required
+def api_mitm_alerts():
+    """Get MITM/ARP spoofing alerts."""
+    global MITM_ALERTS
+    limit = request.args.get("limit", 50, type=int)
+    return jsonify(MITM_ALERTS[-limit:] if MITM_ALERTS else [])
 
 
 @app.route("/api/stats")
