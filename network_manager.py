@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Network Manager Dashboard
-A real network scanner and management tool for your home WiFi.
+Network Analyzer — network security auditing suite for your own WiFi.
 Run with: sudo python3 network_manager.py
 Dashboard: http://localhost:5000
 
 SECURITY FEATURES:
-- Authentication required (default: admin/admin123)
-- Rate limiting on port scans
-- Audit logging for all block/unblock actions
+- Authentication required (hashed password, brute-force lockout, CSRF tokens)
+- Session hardening + security headers
+- Rate limiting on scans/port-scans/vuln-scans/block actions
+- Audit logging for all block/unblock/MITM/parental actions
+- Parental-control rules actually enforced by a background scheduler
+- Real JA3 TLS fingerprinting, OS fingerprinting (passive + active)
+- MITM/ARP-spoof detection, rogue DHCP detection, DNS threat scoring
+
+USE ON NETWORKS YOU OWN OR HAVE EXPLICIT PERMISSION TO TEST.
 """
 
 import os
@@ -25,12 +30,29 @@ import csv
 import io
 import queue
 import hashlib
+import atexit
+import re
+import ipaddress
+import secrets
+import signal
 from datetime import datetime, timedelta
 from collections import defaultdict
 from functools import wraps
+from threading import Lock
 
-from flask import Flask, render_template, jsonify, request, Response, redirect, url_for, flash
+from flask import (
+    Flask,
+    render_template,
+    jsonify,
+    request,
+    Response,
+    redirect,
+    url_for,
+    flash,
+    session,
+)
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 import psutil
 
 # Optional imports for vulnerability scanning — graceful fallback
@@ -59,6 +81,9 @@ except ImportError:
 # Packet capture storage
 captured_packets = []
 packet_capture_active = False
+
+# Thread-safety lock for all in-memory stores touched by the sniff thread
+data_lock = Lock()
 
 # DNS query logging
 dns_queries = []
@@ -90,6 +115,20 @@ LIVE_TRAFFIC_LIMIT = 500
 # Rogue DHCP detection
 ROGUE_DHCP_ALERTS = []
 
+# Per-device traffic estimation (from captured packets)
+per_device_traffic = {}  # mac -> {bytes, packets, last_seen}
+
+# Passive OS fingerprint data observed from traffic: ip -> {ttl, window, dhcp_hostname, last_seen}
+observed_tcp = {}
+
+# Login brute-force protection
+login_attempts = defaultdict(list)
+LOGIN_ATTEMPT_LIMIT = 5
+LOGIN_ATTEMPT_WINDOW = 900  # 15 minutes
+
+# Parental-control scheduler state (only auto-managed devices are auto-restored)
+scheduler_blocked = set()
+
 try:
     from mac_vendor_lookup import MacLookup
 
@@ -113,14 +152,34 @@ except ImportError:
 # CONFIG
 # ============================================================
 APP_HOST = "0.0.0.0"
-APP_PORT = 5000
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "network_manager.db")
-SCAN_INTERVAL = 30  # seconds between auto-scans
+APP_PORT = int(os.environ.get("APP_PORT", "5000"))
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "network_manager.db"),
+)
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "30"))  # seconds between auto-scans
+
+# Ensure the database directory exists (important for Docker volumes)
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir and not os.path.isdir(_db_dir):
+    try:
+        os.makedirs(_db_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[!] Could not create DB directory {_db_dir}: {e}")
 
 # Security config - CHANGE THESE IN PRODUCTION!
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-in-production-abc123xyz")
-DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+if SECRET_KEY == "change-this-in-production-abc123xyz":
+    print("[!] WARNING: Using default SECRET_KEY. Set SECRET_KEY env var in production!")
+
+DEFAULT_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+# Prefer a hashed password. If only a plaintext ADMIN_PASSWORD is given, hash it.
+if os.environ.get("ADMIN_PASSWORD_HASH"):
+    ADMIN_PASSWORD_HASH = os.environ["ADMIN_PASSWORD_HASH"]
+else:
+    ADMIN_PASSWORD_HASH = generate_password_hash(os.environ.get("ADMIN_PASSWORD", "admin123"))
+if os.environ.get("ADMIN_PASSWORD", "admin123") == "admin123" and not os.environ.get("ADMIN_PASSWORD_HASH"):
+    print("[!] WARNING: Using default admin password. Set ADMIN_PASSWORD env var in production!")
 
 # Rate limiting config
 MAX_SCAN_QUEUE_SIZE = 10  # Max pending scans
@@ -131,6 +190,78 @@ SCAN_RATE_LIMIT = 5  # Max scans per minute per IP
 # ============================================================
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+# Session hardening
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,  # 2 MB request body cap
+)
+
+
+def generate_csrf_token():
+    """Return the CSRF token for the current session, creating it if needed."""
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+    return session["_csrf_token"]
+
+
+@app.before_request
+def csrf_guard():
+    """Global CSRF protection for all state-changing requests."""
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        token = (
+            request.headers.get("X-CSRF-Token")
+            or request.form.get("_csrf_token")
+            or (request.get_json(silent=True) or {}).get("_csrf_token")
+        )
+        expected = session.get("_csrf_token", "")
+        if not expected or not token or not secrets.compare_digest(token, expected):
+            return jsonify({"success": False, "error": "CSRF token missing or invalid"}), 403
+
+
+@app.context_processor
+def inject_csrf_token():
+    """Make csrf_token() available to all templates."""
+    return {"csrf_token": generate_csrf_token}
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"success": False, "error": "Not found"}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"success": False, "error": "Internal server error"}), 500
+
+
+@app.errorhandler(Exception)
+def unhandled_error(e):
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(e, HTTPException):
+        # Keep proper HTTP status codes (405, 413, 429, ...) instead of 500
+        return jsonify({"success": False, "error": e.description}), e.code
+    print(f"[!] Unhandled error: {e}")
+    return jsonify({"success": False, "error": "Internal server error"}), 500
+
+
+def get_json_body():
+    """Safely parse a JSON request body, returning {} when absent/malformed."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
 
 # ============================================================
 # LOGIN MANAGER
@@ -214,7 +345,9 @@ def scan_worker():
 # DATABASE
 # ============================================================
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS devices (
@@ -335,6 +468,11 @@ def init_db():
             visit_count INTEGER DEFAULT 1
         )
     """)
+    # Unique per (mac, domain) so visit counts are accurate (fixes inflated counts)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_passive_dns_mac_domain
+        ON passive_dns_log(source_mac, domain)
+    """)
     # SSL CERT TABLE - Store SSL certificate info for local servers
     c.execute("""
         CREATE TABLE IF NOT EXISTS ssl_cert_log (
@@ -368,7 +506,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS os_fingerprint_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
-            device_mac TEXT PRIMARY KEY,
+            device_mac TEXT UNIQUE,
             os_guess TEXT,
             confidence INTEGER,
             ttl INTEGER,
@@ -381,8 +519,13 @@ def init_db():
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
     return conn
 
 
@@ -424,8 +567,24 @@ def get_local_ip():
 
 
 def get_network_range():
-    """Get the network range for scanning."""
+    """Get the network range for scanning, computed from the real netmask."""
     local_ip = get_local_ip()
+    try:
+        for _iface, addrs in psutil.net_if_addrs().items():
+            if _iface == "lo":
+                continue
+            for addr in addrs:
+                if (
+                    addr.family == socket.AF_INET
+                    and addr.address == local_ip
+                    and addr.netmask
+                ):
+                    network = ipaddress.IPv4Network(
+                        f"{addr.address}/{addr.netmask}", strict=False
+                    )
+                    return str(network)
+    except Exception as e:
+        print(f"[!] Netmask detection failed ({e}), falling back to /24")
     parts = local_ip.split(".")
     return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
 
@@ -520,14 +679,15 @@ def guess_device_os(ttl, tcp_window_size, dhcp_hostname, vendor):
     os_guesses = []
     
     # TTL-based OS detection (accounting for hop count, assuming local network = 0-1 hops)
-    if ttl >= 126:
-        os_guesses.append(("Windows", 40))  # Initial TTL 128
-    elif ttl >= 62 and ttl <= 64:
-        os_guesses.append(("Linux/Android", 40))  # Initial TTL 64
-    elif ttl >= 250:
+    # NOTE: check highest initial TTLs FIRST so iOS/macOS (255) isn't caught by the >=126 branch
+    if ttl >= 250:
         os_guesses.append(("iOS/macOS", 40))  # Initial TTL 255
+    elif ttl >= 126:
+        os_guesses.append(("Windows", 40))  # Initial TTL 128
     elif ttl >= 120 and ttl < 126:
         os_guesses.append(("Windows (some hops)", 30))
+    elif ttl >= 62 and ttl <= 64:
+        os_guesses.append(("Linux/Android", 40))  # Initial TTL 64
     elif ttl >= 55 and ttl < 62:
         os_guesses.append(("Linux/Android (some hops)", 30))
     
@@ -761,13 +921,112 @@ def update_devices_db(devices):
                 ),
             )
 
+        # Persist passive OS fingerprint for this device (from observed traffic)
+        save_os_fingerprint(c, dev["mac"], dev["ip"], dev["vendor"])
+
     conn.commit()
     conn.close()
     return new_count
 
 
+def save_os_fingerprint(conn, mac, ip, vendor):
+    """Persist a passive OS fingerprint guess from observed TCP/DHCP data."""
+    try:
+        with data_lock:
+            obs = observed_tcp.get(ip)
+            if not obs or not obs.get("ttl"):
+                return
+            ttl = obs["ttl"]
+            window = obs.get("window") or 0
+            dhcp_hostname = obs.get("dhcp_hostname") or ""
+        os_guess, confidence = guess_device_os(ttl, window, dhcp_hostname, vendor)
+        if not os_guess or os_guess == "Unknown":
+            return
+        conn.execute(
+            """
+            INSERT INTO os_fingerprint_log (timestamp, device_mac, os_guess, confidence, ttl, tcp_window_size, dhcp_hostname)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_mac) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                os_guess = excluded.os_guess,
+                confidence = excluded.confidence,
+                ttl = excluded.ttl,
+                tcp_window_size = excluded.tcp_window_size,
+                dhcp_hostname = excluded.dhcp_hostname
+            """,
+            (
+                datetime.now().isoformat(),
+                mac,
+                os_guess,
+                confidence,
+                ttl,
+                window,
+                dhcp_hostname,
+            ),
+        )
+    except Exception as e:
+        print(f"[!] OS fingerprint save error: {e}")
+
+
+def active_os_fingerprint(ip):
+    """Actively probe a device with a TCP SYN to measure its TTL + window size."""
+    if not SCAPY_AVAILABLE:
+        return None
+    try:
+        from scapy.all import sr1
+
+        conf.verb = 0
+        result = None
+        for port in (80, 443, 22, 8080):
+            try:
+                resp = sr1(
+                    IP(dst=ip) / TCP(dport=port, flags="S"),
+                    timeout=2,
+                    verbose=0,
+                )
+                if resp and TCP in resp and resp[TCP].flags & 0x12:  # SYN-ACK
+                    result = resp
+                    break
+            except Exception:
+                continue
+        if result is None:
+            return None
+        ttl = result[IP].ttl
+        window = result[TCP].window
+        with data_lock:
+            entry = observed_tcp.setdefault(ip, {})
+            entry["ttl"] = ttl
+            entry["window"] = window
+            entry["last_seen"] = time.time()
+            observed_tcp[ip] = entry
+        return {"ttl": ttl, "tcp_window_size": window}
+    except Exception as e:
+        print(f"[!] Active fingerprint error: {e}")
+        return None
+
+
+def notify_alert(message):
+    """Push an alert to configured notification channels (Telegram)."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id or not REQUESTS_AVAILABLE:
+        return
+
+    def _send():
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": f"🛡 Network Analyzer: {message[:3500]}"},
+                timeout=8,
+            )
+        except Exception as e:
+            print(f"[!] Telegram notify error: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def generate_alert(alert_type, message, device_mac=None):
-    """Generate an alert and save to database."""
+    """Generate an alert and save to database (+ push notifications)."""
     try:
         conn = get_db()
         conn.execute("""
@@ -777,6 +1036,7 @@ def generate_alert(alert_type, message, device_mac=None):
         conn.commit()
         conn.close()
         print(f"[!] ALERT [{alert_type}]: {message}")
+        notify_alert(f"[{alert_type}] {message}")
     except Exception as e:
         print(f"[!] Error generating alert: {e}")
 
@@ -816,7 +1076,7 @@ def get_wifi_info():
                     info["bssid"] = line.split(":", 1)[1].strip()
         elif system == "Linux":
             result = subprocess.run(
-                ["iwconfig"], capture_output=True, text=True, stderr=subprocess.STDOUT
+                ["iwconfig"], capture_output=True, text=True
             )
             output = result.stdout
             for line in output.split("\n"):
@@ -885,7 +1145,7 @@ def get_wifi_info():
     return info
 
 
-def wifi_security_scan():
+def wifi_security_scan(wifi_info=None):
     """Perform basic WiFi security assessment."""
     security_info = {
         "encryption": "Unknown",
@@ -894,6 +1154,9 @@ def wifi_security_scan():
         "mac_filtering": "Unknown",
         "recommendations": [],
     }
+
+    if wifi_info is None:
+        wifi_info = get_wifi_info()
 
     try:
         system = platform.system()
@@ -904,7 +1167,9 @@ def wifi_security_scan():
                 result = subprocess.run(
                     ["iwlist", "auth"], capture_output=True, text=True, timeout=5
                 )
-                if "WPA" in result.stdout or "WPA2" in result.stdout:
+                if "WPA3" in result.stdout:
+                    security_info["encryption"] = "WPA3 Detected"
+                elif "WPA2" in result.stdout or "WPA" in result.stdout:
                     security_info["encryption"] = "WPA/WPA2 Detected"
                 elif "WEP" in result.stdout:
                     security_info["encryption"] = "WEP (WEAK)"
@@ -913,30 +1178,26 @@ def wifi_security_scan():
                     )
                 else:
                     security_info["encryption"] = "Open/Unknown"
-
-                # Check for WPS
-                result = subprocess.run(
-                    ["iwlist", "wps"], capture_output=True, text=True, timeout=5
-                )
-                if "WPS" in result.stdout:
-                    security_info["wps"] = "Enabled"
-                    security_info["recommendations"].append(
-                        "Consider disabling WPS due to security vulnerabilities"
-                    )
-                else:
-                    security_info["wps"] = "Disabled/Unknown"
-
             except:
                 pass
 
-        # Add general recommendations
-        if info.get("security") and "open" in info["security"].lower():
+        # Recommendations based on the WiFi info we already collected
+        security_value = wifi_info.get("security", "") or ""
+        security_lower = str(security_value).lower()
+        if "open" in security_lower:
             security_info["recommendations"].append(
-                "Network is open - anyone can connect"
+                "Network is open - anyone can connect. Enable WPA2/WPA3 encryption."
             )
-        elif info.get("security") and "wep" in info["security"].lower():
+        elif "wep" in security_lower:
             security_info["recommendations"].append(
                 "WEP encryption is weak - upgrade to WPA2/WPA3"
+            )
+        elif security_value and "N/A" not in str(security_value):
+            security_info["encryption"] = str(security_value)
+
+        if "wpa3" in security_lower:
+            security_info["recommendations"].append(
+                "WPA3 detected - ensure PMF (Protected Management Frames) is required."
             )
 
     except Exception as e:
@@ -987,62 +1248,60 @@ def get_bandwidth():
     return result
 
 
+hog_tracking = {}  # interface -> {"since": datetime, "pct": float}
+
+
 def check_bandwidth_hogs():
-    """Check if any device is using >80% of total bandwidth for 5 minutes."""
-    global bandwidth_hog_alerts
-    
+    """Detect interfaces sustaining >80% of total bandwidth for 5+ minutes.
+
+    Uses the *rate* (bytes/sec) from get_bandwidth() so the comparison is
+    apples-to-apples (the old code compared cumulative counters against a
+    5-minute sum, which could never work).
+    """
+    global bandwidth_hog_alerts, hog_tracking
+
     try:
-        conn = get_db()
         now = datetime.now()
-        five_min_ago = (now - timedelta(minutes=5)).isoformat()
-        
-        # Get total bandwidth in last 5 minutes
-        total_result = conn.execute("""
-            SELECT SUM(bytes_sent + bytes_recv) as total 
-            FROM bandwidth_log 
-            WHERE timestamp >= ?
-        """, (five_min_ago,)).fetchone()
-        
-        total_bandwidth = total_result["total"] or 0
-        
-        if total_bandwidth == 0:
-            conn.close()
+        speeds = get_bandwidth()
+        total = sum(i["download_speed"] + i["upload_speed"] for i in speeds.values())
+        if total <= 0:
             return
-        
-        # For each device, estimate their bandwidth share based on known IPs
-        # This is a simplified approach - in production you'd track per-IP
-        devices = conn.execute("SELECT ip, mac, hostname FROM devices WHERE is_online = 1").fetchall()
-        
-        # Check interface-level stats and correlate with devices
-        counters = psutil.net_io_counters(pernic=True)
-        for iface, stats in counters.items():
-            if iface == "lo" or iface.startswith("veth") or iface.startswith("docker"):
-                continue
-            
-            # Calculate percentage of total for this interface
-            iface_total = stats.bytes_sent + stats.bytes_recv
-            if total_bandwidth > 0:
-                percentage = (iface_total / total_bandwidth) * 100
-                
-                # If single interface is using >80%, generate alert
-                if percentage > 80:
-                    # Avoid duplicate alerts within 10 minutes
-                    recent_alert = any(
-                        a["timestamp"] > (now - timedelta(minutes=10)).isoformat()
+
+        for iface, info in speeds.items():
+            iface_rate = info["download_speed"] + info["upload_speed"]
+            percentage = (iface_rate / total) * 100
+
+            if percentage > 80:
+                if iface not in hog_tracking:
+                    hog_tracking[iface] = {"since": now, "pct": percentage}
+                    continue
+                sustained = (now - hog_tracking[iface]["since"]) >= timedelta(minutes=5)
+                if sustained:
+                    # Avoid duplicate alerts within 10 minutes per interface
+                    recently_alerted = any(
+                        a["interface"] == iface
+                        and (now - datetime.fromisoformat(a["timestamp"]))
+                        < timedelta(minutes=10)
                         for a in bandwidth_hog_alerts
                     )
-                    
-                    if not recent_alert:
-                        alert_msg = f"Bandwidth hog detected! Interface {iface} using {percentage:.1f}% of total traffic"
-                        bandwidth_hog_alerts.append({
-                            "timestamp": now.isoformat(),
-                            "interface": iface,
-                            "percentage": percentage
-                        })
+                    if not recently_alerted:
+                        alert_msg = (
+                            f"Bandwidth hog detected! Interface {iface} has been "
+                            f"using {percentage:.1f}% of total traffic for 5+ minutes"
+                        )
+                        bandwidth_hog_alerts.append(
+                            {
+                                "timestamp": now.isoformat(),
+                                "interface": iface,
+                                "percentage": percentage,
+                            }
+                        )
+                        if len(bandwidth_hog_alerts) > 50:
+                            bandwidth_hog_alerts = bandwidth_hog_alerts[-50:]
                         generate_alert("bandwidth_hog", alert_msg)
                         print(f"[!] BANDWIDTH HOG: {alert_msg}")
-        
-        conn.close()
+            else:
+                hog_tracking.pop(iface, None)
     except Exception as e:
         print(f"[!] Bandwidth hog check error: {e}")
 
@@ -1053,7 +1312,7 @@ def log_bandwidth():
     conn = get_db()
     now = datetime.now().isoformat()
     for iface, stats in counters.items():
-        if iface == "lo":
+        if iface == "lo" or iface.startswith("veth") or iface.startswith("docker"):
             continue
         conn.execute(
             """
@@ -1544,23 +1803,26 @@ DNS_SPOOF_RULES = {}  # domain -> fake_ip
 def add_dns_spoof_rule(domain, fake_ip):
     """Add a DNS spoof rule - when target queries domain, return fake_ip."""
     global DNS_SPOOF_RULES
-    DNS_SPOOF_RULES[domain.lower()] = fake_ip
+    with data_lock:
+        DNS_SPOOF_RULES[domain.lower()] = fake_ip
     return True, f"DNS spoof rule added: {domain} -> {fake_ip}"
 
 
 def remove_dns_spoof_rule(domain):
     """Remove a DNS spoof rule."""
     global DNS_SPOOF_RULES
-    if domain.lower() in DNS_SPOOF_RULES:
-        del DNS_SPOOF_RULES[domain.lower()]
-        return True, f"DNS spoof rule removed: {domain}"
+    with data_lock:
+        if domain.lower() in DNS_SPOOF_RULES:
+            del DNS_SPOOF_RULES[domain.lower()]
+            return True, f"DNS spoof rule removed: {domain}"
     return False, "Rule not found"
 
 
 def get_dns_spoof_rules():
     """Get all active DNS spoof rules."""
     global DNS_SPOOF_RULES
-    return [{"domain": d, "fake_ip": ip} for d, ip in DNS_SPOOF_RULES.items()]
+    with data_lock:
+        return [{"domain": d, "fake_ip": ip} for d, ip in DNS_SPOOF_RULES.items()]
 
 
 def spoof_dns_response(packet, domain, original_dns_server):
@@ -1597,29 +1859,152 @@ def spoof_dns_response(packet, domain, original_dns_server):
 # ============================================================
 # PACKET SNIFFING WITH DNS, MITM, AND JA3 DETECTION
 # ============================================================
-def calculate_ja3(packet):
-    """Calculate JA3 hash from TLS ClientHello packet."""
+def _parse_client_hello(body):
+    """Parse a TLS ClientHello body into JA3 components.
+
+    Returns (tls_version, ciphers, extension_types, supported_groups, ec_point_formats)
+    per the standard JA3 definition.
+    """
     try:
-        if not TLS in packet or not packet[TLS].payload:
-            return None, None
-        
-        # Extract TLS version, ciphers, extensions, curves, curve formats
-        tls_version = packet[TLS].version
-        ciphers = []
+        if len(body) < 4:
+            return None
+        # handshake header: type(1) + length(3)
+        body = body[4:]
+        if len(body) < 2:
+            return None
+        tls_version = struct.unpack(">H", body[0:2])[0]
+        p = 2 + 32  # skip version + random
+        if p + 1 > len(body):
+            return None
+        session_id_len = body[p]
+        p += 1 + session_id_len
+        if p + 2 > len(body):
+            return None
+        cipher_len = struct.unpack(">H", body[p : p + 2])[0]
+        p += 2
+        if p + cipher_len > len(body):
+            return None
+        ciphers = list(struct.unpack(f">{cipher_len // 2}H", body[p : p + cipher_len]))
+        p += cipher_len
+        if p + 1 > len(body):
+            return None
+        comp_len = body[p]
+        p += 1 + comp_len
         extensions = []
-        curves = []
-        curve_formats = []
-        
-        # Parse TLS payload for ClientHello details
-        raw_data = bytes(packet[TLS].payload)
-        if len(raw_data) < 44:  # Minimum ClientHello size
+        groups = []
+        ec_formats = []
+        if p + 2 <= len(body):
+            ext_total = struct.unpack(">H", body[p : p + 2])[0]
+            p += 2
+            ext_end = min(p + ext_total, len(body))
+            while p + 4 <= ext_end:
+                etype, elen = struct.unpack(">HH", body[p : p + 4])
+                p += 4
+                edata = body[p : p + elen]
+                p += elen
+                extensions.append(etype)
+                if etype == 10 and len(edata) >= 2:  # supported_groups
+                    glen = struct.unpack(">H", edata[0:2])[0]
+                    gdata = edata[2 : 2 + glen]
+                    for i in range(0, len(gdata) - 1, 2):
+                        groups.append(struct.unpack(">H", gdata[i : i + 2])[0])
+                elif etype == 11 and len(edata) >= 1:  # ec_point_formats
+                    flen = edata[0]
+                    ec_formats = list(edata[1 : 1 + flen])
+        return tls_version, ciphers, extensions, groups, ec_formats
+    except Exception:
+        return None
+
+
+def extract_sni(packet):
+    """Extract the SNI hostname from a TLS ClientHello (no decryption)."""
+    try:
+        if TCP not in packet or Raw not in packet:
+            return None
+        data = bytes(packet[Raw].load)
+        off = 0
+        while off + 5 <= len(data):
+            rtype, _ver, rlen = (
+                data[off],
+                struct.unpack(">H", data[off + 1 : off + 3])[0],
+                struct.unpack(">H", data[off + 3 : off + 5])[0],
+            )
+            if rtype == 22 and rlen > 4 and off + 5 + rlen <= len(data):
+                hs = data[off + 5 : off + 5 + rlen]
+                if hs[0] == 1:  # ClientHello
+                    body = hs[4:]
+                    p = 2 + 32
+                    if p + 1 > len(body):
+                        return None
+                    p += 1 + body[p]
+                    if p + 2 > len(body):
+                        return None
+                    cipher_len = struct.unpack(">H", body[p : p + 2])[0]
+                    p += 2 + cipher_len
+                    if p + 1 > len(body):
+                        return None
+                    p += 1 + body[p]
+                    if p + 2 > len(body):
+                        return None
+                    ext_total = struct.unpack(">H", body[p : p + 2])[0]
+                    p += 2
+                    ext_end = min(p + ext_total, len(body))
+                    while p + 4 <= ext_end:
+                        etype, elen = struct.unpack(">HH", body[p : p + 4])
+                        p += 4
+                        edata = body[p : p + elen]
+                        p += elen
+                        if etype == 0 and len(edata) >= 5:  # server_name
+                            # list_len(2) + name_type(1) + name_len(2) + name
+                            nl = struct.unpack(">H", edata[3:5])[0]
+                            name = edata[5 : 5 + nl]
+                            return name.decode("utf-8", errors="ignore")
+                off += 5 + rlen
+            else:
+                off += 1
+        return None
+    except Exception:
+        return None
+
+
+def calculate_ja3(packet):
+    """Calculate a real JA3 hash from a TLS ClientHello packet.
+
+    Parses the raw TLS record bytes: SSL version, cipher suites, extension
+    types, supported groups (curves) and EC point formats, then MD5-hashes the
+    canonical JA3 string.
+    """
+    try:
+        if TCP not in packet or Raw not in packet:
             return None, None
-            
-        # Simple JA3 calculation (in production use ja3 library)
-        ja3_raw = f"{tls_version},{','.join(map(str, ciphers))},{','.join(map(str, extensions))},{','.join(map(str, curves))},{','.join(map(str, curve_formats))}"
-        ja3_hash = hashlib.md5(ja3_raw.encode()).hexdigest()
-        
-        return ja3_hash, ja3_raw
+
+        data = bytes(packet[Raw].load)
+        off = 0
+        while off + 5 <= len(data):
+            rtype, _ver, rlen = (
+                data[off],
+                struct.unpack(">H", data[off + 1 : off + 3])[0],
+                struct.unpack(">H", data[off + 3 : off + 5])[0],
+            )
+            if rtype == 22 and rlen > 4 and off + 5 + rlen <= len(data):
+                hs = data[off + 5 : off + 5 + rlen]
+                if hs[0] == 1:  # handshake type ClientHello
+                    parsed = _parse_client_hello(hs)
+                    if not parsed:
+                        return None, None
+                    tls_version, ciphers, extensions, groups, ec_formats = parsed
+                    ja3_raw = (
+                        f"{tls_version},"
+                        f"{','.join(map(str, ciphers))},"
+                        f"{','.join(map(str, extensions))},"
+                        f"{','.join(map(str, groups))},"
+                        f"{','.join(map(str, ec_formats))}"
+                    )
+                    return hashlib.md5(ja3_raw.encode()).hexdigest(), ja3_raw
+                off += 5 + rlen
+            else:
+                off += 1
+        return None, None
     except Exception as e:
         print(f"[!] JA3 calculation error: {e}")
         return None, None
@@ -1679,9 +2064,10 @@ def process_dns_query(packet, source_ip, source_mac):
             "is_malicious": is_malicious
         }
         
-        dns_queries.append(dns_entry)
-        if len(dns_queries) > DNS_QUERY_LIMIT:
-            dns_queries = dns_queries[-DNS_QUERY_LIMIT:]
+        with data_lock:
+            dns_queries.append(dns_entry)
+            if len(dns_queries) > DNS_QUERY_LIMIT:
+                dns_queries = dns_queries[-DNS_QUERY_LIMIT:]
         
         # Save to dns_query_log (real-time with threat scoring)
         conn = get_db()
@@ -1693,18 +2079,16 @@ def process_dns_query(packet, source_ip, source_mac):
         # ALSO save to passive_dns_log (for "Top 5 sites per device" feature)
         # Extract base domain (e.g., www.google.com -> google.com)
         base_domain = '.'.join(query_name.split('.')[-2:]) if len(query_name.split('.')) > 1 else query_name
+        # Atomic upsert keyed on (source_mac, domain) via the UNIQUE index
         conn.execute("""
-            INSERT INTO passive_dns_log (timestamp, source_mac, source_ip, domain)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT DO NOTHING
+            INSERT INTO passive_dns_log (timestamp, source_mac, source_ip, domain, visit_count)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(source_mac, domain)
+            DO UPDATE SET visit_count = visit_count + 1,
+                          timestamp = excluded.timestamp,
+                          source_ip = excluded.source_ip
         """, (dns_entry["timestamp"], source_mac, source_ip, base_domain))
-        
-        # Update visit count
-        conn.execute("""
-            UPDATE passive_dns_log SET visit_count = visit_count + 1, timestamp = ?
-            WHERE source_mac = ? AND domain = ?
-        """, (dns_entry["timestamp"], source_mac, base_domain))
-        
+
         conn.commit()
         conn.close()
         
@@ -1724,14 +2108,16 @@ def detect_mitm(packet):
         if ARP in packet and packet[ARP].op == 2:  # ARP reply
             ip = packet[ARP].psrc
             mac = packet[ARP].hwsrc.upper()
-            
-            if ip not in arp_table:
-                arp_table[ip] = set()
-            
+
+            with data_lock:
+                if ip not in arp_table:
+                    arp_table[ip] = set()
+                known_macs = set(arp_table[ip])
+
             # If we see a different MAC for the same IP, it's likely ARP spoofing
-            if mac not in arp_table[ip] and len(arp_table[ip]) > 0:
+            if mac not in known_macs and len(known_macs) > 0:
                 # MITM detected!
-                existing_macs = ', '.join(arp_table[ip])
+                existing_macs = ', '.join(sorted(known_macs))
                 alert_msg = f"ARP Spoofing detected! IP {ip} has multiple MACs: {existing_macs}, {mac}"
                 
                 # Log to MITM alerts
@@ -1742,9 +2128,10 @@ def detect_mitm(packet):
                     "existing_macs": existing_macs,
                     "alert": alert_msg
                 }
-                MITM_ALERTS.append(mitm_entry)
-                if len(MITM_ALERTS) > 100:
-                    MITM_ALERTS = MITM_ALERTS[-100:]
+                with data_lock:
+                    MITM_ALERTS.append(mitm_entry)
+                    if len(MITM_ALERTS) > 100:
+                        MITM_ALERTS = MITM_ALERTS[-100:]
                 
                 # Generate alert
                 generate_alert("mitm_attack", alert_msg, mac)
@@ -1760,7 +2147,8 @@ def detect_mitm(packet):
                 
                 print(f"[!] MITM ATTACK DETECTED: {alert_msg}")
             
-            arp_table[ip].add(mac)
+            with data_lock:
+                arp_table[ip].add(mac)
             
     except Exception as e:
         print(f"[!] MITM detection error: {e}")
@@ -1789,11 +2177,10 @@ def process_tls_fingerprint(packet, source_ip, source_mac):
                     "is_suspicious": is_suspicious
                 }
                 
-                ja3_fingerprints.append(ja3_entry)
-                if len(ja3_fingerprints) > JA3_LIMIT:
-                    ja3_fingerprints = ja3_fingerprints[-JA3_LIMIT:]
-                
-                # Save to database
+                with data_lock:
+                    ja3_fingerprints.append(ja3_entry)
+                    if len(ja3_fingerprints) > JA3_LIMIT:
+                        ja3_fingerprints = ja3_fingerprints[-JA3_LIMIT:]
                 conn = get_db()
                 conn.execute("""
                     INSERT INTO ja3_log (timestamp, source_ip, source_mac, ja3_hash, ja3_raw, matched_malware, is_suspicious)
@@ -1813,21 +2200,63 @@ def process_tls_fingerprint(packet, source_ip, source_mac):
 
 
 def packet_handler(packet):
-    """Handle captured packets with DNS, MITM, JA3 detection, and live traffic logging."""
-    global captured_packets, live_traffic
-    
+    """Handle captured packets: DNS, MITM, JA3 detection, live traffic,
+    per-device traffic estimation, and passive OS observation."""
+    global captured_packets, live_traffic, per_device_traffic, observed_tcp
+
     # Rogue DHCP detection
     if DHCP in packet and packet.haslayer(DHCP):
         detect_rogue_dhcp(packet)
-    
+
     try:
         if IP in packet:
             source_ip = packet[IP].src
             source_mac = packet[Ether].src.upper() if Ether in packet else "unknown"
-            
+
+            # Passive OS fingerprint observation: capture TTL + TCP window
+            if TCP in packet:
+                with data_lock:
+                    prev = observed_tcp.get(source_ip, {})
+                    prev["ttl"] = packet[IP].ttl
+                    prev["window"] = packet[TCP].window
+                    prev["last_seen"] = time.time()
+                    observed_tcp[source_ip] = prev
+                    # Bound: drop entries not seen for over an hour
+                    if len(observed_tcp) > 500:
+                        stale = [k for k, v in observed_tcp.items()
+                                 if time.time() - v.get("last_seen", 0) > 3600]
+                        for k in stale[:100]:
+                            observed_tcp.pop(k, None)
+
+            # DHCP hostname observation (option 12)
+            if DHCP in packet:
+                try:
+                    for opt in packet[DHCP].options:
+                        if isinstance(opt, tuple) and opt[0] == "hostname":
+                            with data_lock:
+                                entry = observed_tcp.setdefault(source_ip, {})
+                                entry["dhcp_hostname"] = opt[1].decode("utf-8", errors="ignore")
+                            break
+                except Exception:
+                    pass
+
+            # Per-device traffic estimation
+            if source_mac != "unknown":
+                with data_lock:
+                    info = per_device_traffic.get(source_mac, {"bytes": 0, "packets": 0, "last_seen": 0})
+                    info["bytes"] += len(packet)
+                    info["packets"] += 1
+                    info["last_seen"] = datetime.now().isoformat()
+                    per_device_traffic[source_mac] = info
+                # Bound the dict size
+                if len(per_device_traffic) > 300:
+                    with data_lock:
+                        oldest = min(per_device_traffic, key=lambda k: per_device_traffic[k]["last_seen"])
+                        per_device_traffic.pop(oldest, None)
+
             # Live traffic viewer - log HTTP hostnames and DNS queries
             traffic_entry = None
-            
+
             # Extract HTTP Host header
             if TCP in packet and Raw in packet:
                 try:
@@ -1848,11 +2277,10 @@ def packet_handler(packet):
                                 break
                 except:
                     pass
-            
+
             # Process DNS queries (also adds to live traffic)
             if DNS in packet and DNSQR in packet:
                 process_dns_query(packet, source_ip, source_mac)
-                # Also add to live traffic for real-time view
                 query_name = packet[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
                 traffic_entry = {
                     "timestamp": datetime.now().isoformat(),
@@ -1862,18 +2290,22 @@ def packet_handler(packet):
                     "domain": query_name,
                     "details": f"DNS query: {query_name}"
                 }
-                
-                # Check for DNS spoof rules and respond with fake IP if matched
-                if DNS_SPOOF_RULES and query_name.lower() in DNS_SPOOF_RULES:
-                    # Find original DNS server
-                    dns_server_ip = packet[IP].dst
-                    fake_ip = spoof_dns_response(packet, query_name, dns_server_ip)
-                    traffic_entry["details"] += f" [SPOOFED -> {fake_ip}]"
-            
+                # DNS spoof rule match -> respond with fake IP (educational lab)
+                if DNS_SPOOF_RULES:
+                    with data_lock:
+                        rule_domain = query_name.lower()
+                    if rule_domain in DNS_SPOOF_RULES:
+                        try:
+                            dns_server_ip = packet[IP].dst
+                            fake_ip = spoof_dns_response(packet, query_name, dns_server_ip)
+                            traffic_entry["details"] += f" [SPOOFED -> {fake_ip}]"
+                        except Exception as e:
+                            print(f"[!] DNS spoof error: {e}")
+
             # Extract SNI from TLS ClientHello (HTTPS domains without decryption)
-            if TLS in packet and TLSClientHello in packet:
+            if TLS in packet or (TCP in packet and Raw in packet):
                 try:
-                    sni = packet[TLSClientHello].extensions[0].servername.decode('utf-8', errors='ignore')
+                    sni = extract_sni(packet)
                     if sni:
                         traffic_entry = {
                             "timestamp": datetime.now().isoformat(),
@@ -1883,15 +2315,16 @@ def packet_handler(packet):
                             "domain": sni,
                             "details": f"HTTPS connection to {sni} (from SNI)"
                         }
-                except:
+                except Exception:
                     pass
-            
+
             # Add to live traffic if we have an entry
             if traffic_entry:
-                live_traffic.append(traffic_entry)
-                if len(live_traffic) > LIVE_TRAFFIC_LIMIT:
-                    live_traffic = live_traffic[-LIVE_TRAFFIC_LIMIT:]
-            
+                with data_lock:
+                    live_traffic.append(traffic_entry)
+                    if len(live_traffic) > LIVE_TRAFFIC_LIMIT:
+                        live_traffic = live_traffic[-LIVE_TRAFFIC_LIMIT:]
+
             packet_info = {
                 "timestamp": datetime.now().isoformat(),
                 "src_ip": source_ip,
@@ -1905,7 +2338,7 @@ def packet_handler(packet):
                 packet_info["src_port"] = packet[TCP].sport
                 packet_info["dst_port"] = packet[TCP].dport
                 packet_info["protocol_name"] = "TCP"
-                packet_info["flags"] = packet[TCP].flags
+                packet_info["flags"] = str(packet[TCP].flags)
             elif UDP in packet:
                 packet_info["src_port"] = packet[UDP].sport
                 packet_info["dst_port"] = packet[UDP].dport
@@ -1919,15 +2352,16 @@ def packet_handler(packet):
 
             # Detect MITM attacks
             detect_mitm(packet)
-            
-            # Process TLS fingerprints
-            if TLS in packet:
+
+            # Process TLS fingerprints (JA3)
+            if TCP in packet and Raw in packet:
                 process_tls_fingerprint(packet, source_ip, source_mac)
 
             # Keep only last 1000 packets to avoid memory issues
-            captured_packets.append(packet_info)
-            if len(captured_packets) > 1000:
-                captured_packets = captured_packets[-1000:]
+            with data_lock:
+                captured_packets.append(packet_info)
+                if len(captured_packets) > 1000:
+                    captured_packets = captured_packets[-1000:]
     except Exception as e:
         print(f"[!] Error processing packet: {e}")
 
@@ -1978,9 +2412,10 @@ def detect_rogue_dhcp(packet):
                     "message_type": "DHCP_OFFER" if message_type == 2 else "DHCP_ACK"
                 }
                 
-                ROGUE_DHCP_ALERTS.append(rogure_entry)
-                if len(ROGUE_DHCP_ALERTS) > 50:
-                    ROGUE_DHCP_ALERTS = ROGUE_DHCP_ALERTS[-50:]
+                with data_lock:
+                    ROGUE_DHCP_ALERTS.append(rogure_entry)
+                    if len(ROGUE_DHCP_ALERTS) > 50:
+                        ROGUE_DHCP_ALERTS = ROGUE_DHCP_ALERTS[-50:]
                 
                 generate_alert("rogue_dhcp", alert_msg, sender_mac)
                 print(f"[!] ROGUE DHCP SERVER DETECTED: {alert_msg}")
@@ -2035,13 +2470,15 @@ def stop_packet_capture():
 
 def get_captured_packets(limit=100):
     """Get captured packets."""
-    return captured_packets[-limit:] if captured_packets else []
+    with data_lock:
+        return captured_packets[-limit:] if captured_packets else []
 
 
 def clear_captured_packets():
     """Clear captured packets."""
     global captured_packets
-    captured_packets = []
+    with data_lock:
+        captured_packets = []
     return True, "Cleared captured packets"
 
 
@@ -2107,6 +2544,7 @@ def background_scanner():
     """Background thread that periodically scans the network."""
     global scanner_running
     scanner_running = True
+    last_prune = 0
     
     # Start the scan queue worker
     worker_thread = threading.Thread(target=scan_worker, daemon=True)
@@ -2141,6 +2579,11 @@ def background_scanner():
 
             # Check for security events and log them
             check_security_events(devices)
+
+            # Prune old data roughly every 6 hours
+            if time.time() - last_prune > 6 * 3600:
+                prune_old_data()
+                last_prune = time.time()
         except Exception as e:
             print(f"[!] Scan error: {e}")
         time.sleep(SCAN_INTERVAL)
@@ -2239,29 +2682,187 @@ def generate_security_report():
 
 
 # ============================================================
+# PARENTAL CONTROL ENFORCER
+# ============================================================
+def _rule_applies_today(rule_day, weekday):
+    if rule_day == "everyday":
+        return True
+    if rule_day == "weekdays":
+        return weekday in ("monday", "tuesday", "wednesday", "thursday", "friday")
+    if rule_day == "weekends":
+        return weekday in ("saturday", "sunday")
+    return rule_day == weekday
+
+
+def _time_in_window(now, start_time, end_time):
+    """Check if now falls inside [start, end], supporting overnight windows."""
+    try:
+        start_parts = list(map(int, start_time.split(":")))
+        end_parts = list(map(int, end_time.split(":")))
+        start_min = start_parts[0] * 60 + start_parts[1]
+        end_min = end_parts[0] * 60 + end_parts[1]
+        now_min = now.hour * 60 + now.minute
+    except (ValueError, IndexError):
+        return False
+    if start_min <= end_min:
+        return start_min <= now_min <= end_min
+    # Overnight window (e.g. 22:00 -> 07:00)
+    return now_min >= start_min or now_min <= end_min
+
+
+def parental_enforcer():
+    """Background thread that actually enforces parental schedule rules."""
+    global scheduler_blocked
+    while scanner_running:
+        try:
+            now = datetime.now()
+            weekday = now.strftime("%A").lower()
+
+            conn = get_db()
+            rules = conn.execute("SELECT * FROM parental_rules").fetchall()
+            conn.close()
+
+            gateway = get_default_gateway()
+            to_block, to_unblock = [], []
+            for rule in rules:
+                if rule["action"] != "block":
+                    continue
+                if not _rule_applies_today(rule["day_of_week"], weekday):
+                    continue
+                if _time_in_window(now, rule["start_time"], rule["end_time"]):
+                    to_block.append(rule["device_mac"])
+                else:
+                    to_unblock.append(rule["device_mac"])
+
+            conn = get_db()
+            for mac in set(to_block):
+                if mac in scheduler_blocked:
+                    continue
+                device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+                if not device:
+                    continue
+                success, msg = block_device(device["ip"], gateway)
+                if success:
+                    scheduler_blocked.add(mac)
+                    conn.execute("UPDATE devices SET is_blocked = 1 WHERE mac = ?", (mac,))
+                    conn.execute(
+                        "INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success) "
+                        "VALUES (?, 'parental_block', ?, ?, 'scheduler', ?, 1)",
+                        (now.isoformat(), mac, device["ip"], msg),
+                    )
+                    generate_alert("parental_block", f"Parental rule: blocked {device['ip']}", mac)
+
+            for mac in set(to_unblock):
+                if mac not in scheduler_blocked:
+                    continue
+                device = conn.execute("SELECT ip FROM devices WHERE mac = ?", (mac,)).fetchone()
+                if not device:
+                    continue
+                success, msg = unblock_device(device["ip"], gateway)
+                if success:
+                    scheduler_blocked.discard(mac)
+                    conn.execute("UPDATE devices SET is_blocked = 0 WHERE mac = ?", (mac,))
+                    conn.execute(
+                        "INSERT INTO audit_log (timestamp, action_type, device_mac, device_ip, user, details, success) "
+                        "VALUES (?, 'parental_unblock', ?, ?, 'scheduler', ?, 1)",
+                        (now.isoformat(), mac, device["ip"], msg),
+                    )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[!] Parental enforcer error: {e}")
+        time.sleep(30)
+
+
+def prune_old_data():
+    """Remove old logs to keep the database small (runs ~every 6 hours)."""
+    try:
+        conn = get_db()
+        cutoffs = {
+            "alerts": timedelta(days=int(os.environ.get("RETAIN_ALERTS_DAYS", "30"))),
+            "audit_log": timedelta(days=int(os.environ.get("RETAIN_AUDIT_DAYS", "90"))),
+            "dns_query_log": timedelta(days=int(os.environ.get("RETAIN_DNS_DAYS", "14"))),
+            "passive_dns_log": timedelta(days=int(os.environ.get("RETAIN_DNS_DAYS", "14"))),
+            "bandwidth_log": timedelta(days=int(os.environ.get("RETAIN_BW_DAYS", "7"))),
+            "ja3_log": timedelta(days=int(os.environ.get("RETAIN_JA3_DAYS", "30"))),
+            "port_scan_history": timedelta(days=int(os.environ.get("RETAIN_PORT_DAYS", "90"))),
+        }
+        for table, days in cutoffs.items():
+            cutoff = (datetime.now() - days).isoformat()
+            conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        conn.close()
+        print("[*] Old data pruned")
+    except Exception as e:
+        print(f"[!] Prune error: {e}")
+
+
+def cleanup_network_actions():
+    """On shutdown: stop packet capture, restore ARP tables for all
+    blocked devices and MITM targets so the network is left clean."""
+    global scanner_running, blocking_threads, active_mitm_attacks
+    scanner_running = False
+    stop_packet_capture()
+
+    gateway = get_default_gateway()
+    for ip in list(blocking_threads.keys()):
+        try:
+            unblock_device(ip, gateway)
+        except Exception:
+            pass
+    for ip in list(active_mitm_attacks.keys()):
+        try:
+            stop_mitm_attack(ip)
+        except Exception:
+            pass
+    time.sleep(1)
+    print("[*] Network actions cleaned up (ARP tables restored)")
+
+
+# ============================================================
 # API ROUTES
 # ============================================================
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """Login page."""
+    """Login page with brute-force lockout and CSRF protection."""
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
-    
+
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
-        
-        if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        client_ip = request.remote_addr or "unknown"
+
+        # Brute-force lockout: max 5 failed attempts per 15 minutes per IP
+        now = time.time()
+        login_attempts[client_ip] = [
+            t for t in login_attempts[client_ip] if now - t < LOGIN_ATTEMPT_WINDOW
+        ]
+        if len(login_attempts[client_ip]) >= LOGIN_ATTEMPT_LIMIT:
+            flash(
+                "Too many failed login attempts. Please wait 15 minutes.",
+                "error",
+            )
+            return render_template("login.html")
+
+        if username == DEFAULT_USERNAME and check_password_hash(
+            ADMIN_PASSWORD_HASH, password
+        ):
+            login_attempts[client_ip] = []
             user = User(username)
             login_user(user)
             flash("Logged in successfully!", "success")
+            # Only allow safe relative redirects (fixes open-redirect)
             next_page = request.args.get("next")
-            return redirect(next_page or url_for("dashboard"))
+            if next_page and next_page.startswith("/") and not next_page.startswith("//"):
+                return redirect(next_page)
+            return redirect(url_for("dashboard"))
         else:
+            login_attempts[client_ip].append(now)
             flash("Invalid username or password", "error")
-    
+
     return render_template("login.html")
 
 
@@ -2283,11 +2884,16 @@ def dashboard():
 @app.route("/api/scan", methods=["POST"])
 @login_required
 def api_scan():
-    """Trigger a manual network scan."""
+    """Trigger a manual network scan (rate limited)."""
+    client_ip = request.remote_addr
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+
     start = time.time()
     devices = arp_scan()
     new_count = update_devices_db(devices)
     duration = time.time() - start
+    record_scan(client_ip)
     
     # Log the scan action
     conn = get_db()
@@ -2334,6 +2940,11 @@ def api_devices():
         else:
             dev_dict["os_guess"] = None
             dev_dict["os_confidence"] = 0
+        # Attach traffic estimate if observed
+        with data_lock:
+            traffic = per_device_traffic.get(d["mac"])
+        dev_dict["traffic_bytes"] = traffic["bytes"] if traffic else None
+        dev_dict["traffic_packets"] = traffic["packets"] if traffic else None
         device_list.append(dev_dict)
     
     conn.close()
@@ -2344,12 +2955,25 @@ def api_devices():
 @login_required
 def api_update_device(mac):
     """Update device info (custom name, type, notes, known status)."""
-    data = request.json
+    data = get_json_body()
     conn = get_db()
     fields = []
     values = []
+    valid_types = {
+        "unknown", "phone", "tablet", "laptop", "desktop", "tv", "printer",
+        "smart_speaker", "camera", "iot", "router", "other",
+    }
     for key in ["custom_name", "device_type", "notes", "is_known"]:
         if key in data:
+            if key == "device_type" and data[key] not in valid_types:
+                continue
+            if key == "is_known":
+                try:
+                    data[key] = int(data[key])
+                except (TypeError, ValueError):
+                    continue
+            if key in ("custom_name", "notes"):
+                data[key] = str(data[key])[:200]
             fields.append(f"{key} = ?")
             values.append(data[key])
     if fields:
@@ -2442,10 +3066,11 @@ def api_unblock_device(mac):
 
 
 @app.route("/api/devices/<mac>/message", methods=["POST"])
+@login_required
 def api_send_message(mac):
-    """Send a message to a device."""
-    data = request.json
-    message = data.get("message", "")
+    """Send a message to a device (authentication required)."""
+    data = get_json_body()
+    message = str(data.get("message", ""))[:500]
     if not message:
         return jsonify({"success": False, "error": "No message provided"}), 400
 
@@ -2469,8 +3094,18 @@ def api_port_scan(mac):
     if not check_rate_limit(client_ip):
         return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
     
-    data = request.json or {}
-    port_range = data.get("range", "1-1024")
+    data = get_json_body()
+    port_range = str(data.get("range", "1-1024"))
+
+    # Validate port range format and bounds
+    match = re.match(r"^(\d{1,5})-(\d{1,5})$", port_range)
+    if not match:
+        return jsonify({"success": False, "error": "Invalid port range. Use format start-end, e.g. 1-1024"}), 400
+    start_p, end_p = int(match.group(1)), int(match.group(2))
+    if not (1 <= start_p <= 65535 and 1 <= end_p <= 65535 and start_p <= end_p):
+        return jsonify({"success": False, "error": "Port range must be between 1 and 65535"}), 400
+    if (end_p - start_p) > 10000:
+        return jsonify({"success": False, "error": "Port range too large (max 10000 ports)"}), 400
 
     conn = get_db()
     device = conn.execute("SELECT ip, mac FROM devices WHERE mac = ?", (mac,)).fetchone()
@@ -2509,6 +3144,48 @@ def api_port_scan(mac):
         return jsonify({"success": True, "ip": device["ip"], "ports": ports})
     except queue.Empty:
         return jsonify({"success": False, "error": "Scan timed out"}), 504
+
+
+@app.route("/api/devices/<mac>/fingerprint", methods=["POST"])
+@login_required
+def api_device_fingerprint(mac):
+    """Actively fingerprint a device's OS (TCP SYN probe for TTL + window)."""
+    client_ip = request.remote_addr
+    if not check_rate_limit(client_ip):
+        return jsonify({"success": False, "error": "Rate limit exceeded. Please wait."}), 429
+
+    conn = get_db()
+    device = conn.execute("SELECT ip, mac, vendor FROM devices WHERE mac = ?", (mac,)).fetchone()
+    conn.close()
+    if not device:
+        return jsonify({"success": False, "error": "Device not found"}), 404
+
+    if not SCAPY_AVAILABLE:
+        return jsonify({"success": False, "error": "Scapy not installed - cannot probe"}), 400
+
+    record_scan(client_ip)
+    result = active_os_fingerprint(device["ip"])
+    if not result:
+        return jsonify({"success": False, "error": "Device did not respond to probe"}), 408
+
+    # Save the result
+    conn = get_db()
+    save_os_fingerprint(conn, device["mac"], device["ip"], device["vendor"] or "Unknown")
+    os_row = conn.execute(
+        "SELECT os_guess, confidence FROM os_fingerprint_log WHERE device_mac = ?",
+        (device["mac"],),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "ip": device["ip"],
+        "ttl": result["ttl"],
+        "tcp_window_size": result["tcp_window_size"],
+        "os_guess": os_row["os_guess"] if os_row else "Unknown",
+        "os_confidence": os_row["confidence"] if os_row else 0,
+    })
 
 
 @app.route("/api/devices/<mac>/vulnscan", methods=["POST"])
@@ -2558,8 +3235,8 @@ def api_wifi():
 @login_required
 def api_wifi_security():
     """Get WiFi security information."""
-    security_info = wifi_security_scan()
     wifi_info = get_wifi_info()
+    security_info = wifi_security_scan(wifi_info)
     return jsonify({"wifi": wifi_info, "security": security_info})
 
 
@@ -2595,10 +3272,14 @@ def api_speedtest():
 @login_required
 def api_start_packet_capture():
     """Start packet capture."""
-    data = request.json or {}
-    interface = data.get("interface")
-    filter_str = data.get("filter", "")
-    count = data.get("count", 0)
+    data = get_json_body()
+    interface = str(data.get("interface") or "") or None
+    filter_str = str(data.get("filter") or "")[:200]
+    try:
+        count = int(data.get("count", 0))
+        count = max(0, min(count, 1_000_000))
+    except (TypeError, ValueError):
+        count = 0
 
     success, message = start_packet_capture(interface, filter_str, count)
     
@@ -2652,7 +3333,7 @@ def api_clear_packet_capture():
 @login_required
 def api_get_packet_capture_data():
     """Get captured packet data."""
-    limit = request.args.get("limit", 100, type=int)
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
     packets = get_captured_packets(limit)
     return jsonify({"packets": packets, "count": len(packets)})
 
@@ -2662,8 +3343,9 @@ def api_get_packet_capture_data():
 def api_alerts():
     """Get alerts."""
     conn = get_db()
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 500)
     alerts = conn.execute(
-        "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 50"
+        "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
     return jsonify([dict(a) for a in alerts])
@@ -2685,7 +3367,7 @@ def api_mark_alerts_read():
 def api_audit_log():
     """Get audit log entries."""
     conn = get_db()
-    limit = request.args.get("limit", 100, type=int)
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
     action_type = request.args.get("action_type")
     
     if action_type:
@@ -2707,8 +3389,8 @@ def api_audit_log():
 def api_dns_queries():
     """Get DNS query log with threat scoring."""
     conn = get_db()
-    limit = request.args.get("limit", 100, type=int)
-    min_threat = request.args.get("min_threat", 0, type=int)
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
+    min_threat = max(request.args.get("min_threat", 0, type=int), 0)
     
     if min_threat > 0:
         queries = conn.execute(
@@ -2730,7 +3412,7 @@ def api_passive_dns():
     """Get passive DNS log - top domains per device."""
     conn = get_db()
     mac = request.args.get("mac")
-    limit = request.args.get("limit", 50, type=int)
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 200)
     
     if mac:
         # Get top domains for specific device
@@ -2763,7 +3445,7 @@ def api_port_history():
     conn = get_db()
     mac = request.args.get("mac")
     new_only = request.args.get("new_only", "false").lower() == "true"
-    limit = request.args.get("limit", 200, type=int)
+    limit = min(max(request.args.get("limit", 200, type=int), 1), 500)
     
     if mac:
         if new_only:
@@ -2797,7 +3479,7 @@ def api_port_history():
 def api_ja3_fingerprints():
     """Get JA3 fingerprint log."""
     conn = get_db()
-    limit = request.args.get("limit", 100, type=int)
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
     suspicious_only = request.args.get("suspicious", "false").lower() == "true"
     
     if suspicious_only:
@@ -2819,8 +3501,9 @@ def api_ja3_fingerprints():
 def api_mitm_alerts():
     """Get MITM/ARP spoofing alerts."""
     global MITM_ALERTS
-    limit = request.args.get("limit", 50, type=int)
-    return jsonify(MITM_ALERTS[-limit:] if MITM_ALERTS else [])
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 500)
+    with data_lock:
+        return jsonify(MITM_ALERTS[-limit:] if MITM_ALERTS else [])
 
 
 @app.route("/api/rogue-dhcp-alerts")
@@ -2828,8 +3511,9 @@ def api_mitm_alerts():
 def api_rogue_dhcp_alerts():
     """Get Rogue DHCP server alerts."""
     global ROGUE_DHCP_ALERTS
-    limit = request.args.get("limit", 50, type=int)
-    return jsonify(ROGUE_DHCP_ALERTS[-limit:] if ROGUE_DHCP_ALERTS else [])
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 500)
+    with data_lock:
+        return jsonify(ROGUE_DHCP_ALERTS[-limit:] if ROGUE_DHCP_ALERTS else [])
 
 
 @app.route("/api/live-traffic")
@@ -2837,8 +3521,24 @@ def api_rogue_dhcp_alerts():
 def api_live_traffic():
     """Get live traffic viewer data (HTTP hostnames, DNS queries, TLS SNI)."""
     global live_traffic
-    limit = request.args.get("limit", 100, type=int)
-    return jsonify(live_traffic[-limit:] if live_traffic else [])
+    limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
+    with data_lock:
+        return jsonify(live_traffic[-limit:] if live_traffic else [])
+
+
+@app.route("/api/traffic-summary")
+@login_required
+def api_traffic_summary():
+    """Get per-device traffic estimates collected from captured packets."""
+    global per_device_traffic
+    with data_lock:
+        summary = [
+            {"mac": mac, "bytes": info["bytes"], "packets": info["packets"],
+             "last_seen": info["last_seen"]}
+            for mac, info in per_device_traffic.items()
+        ]
+    summary.sort(key=lambda x: x["bytes"], reverse=True)
+    return jsonify(summary)
 
 
 @app.route("/api/active-mitm", methods=["GET"])
@@ -2859,9 +3559,14 @@ def api_start_mitm(mac):
     if not device:
         return jsonify({"success": False, "error": "Device not found"}), 404
     
-    data = request.json or {}
-    enable_dns_spoof = data.get("dns_spoof", False)
-    fake_ip = data.get("fake_ip", None)
+    data = get_json_body()
+    enable_dns_spoof = bool(data.get("dns_spoof", False))
+    fake_ip = data.get("fake_ip")
+    if fake_ip is not None:
+        try:
+            ipaddress.ip_address(str(fake_ip))
+        except ValueError:
+            return jsonify({"success": False, "error": "Invalid fake_ip"}), 400
     
     success, msg = start_mitm_attack(device["ip"], enable_dns_spoof, fake_ip)
     return jsonify({"success": success, "message": msg})
@@ -2893,13 +3598,19 @@ def api_get_dns_spoof_rules():
 @login_required
 def api_add_dns_spoof_rule():
     """Add a DNS spoof rule for phishing lab simulation."""
-    data = request.json
-    domain = data.get("domain")
-    fake_ip = data.get("fake_ip")
-    
+    data = get_json_body()
+    domain = str(data.get("domain", "")).strip().lower()[:255]
+    fake_ip = str(data.get("fake_ip", "")).strip()
+
     if not domain or not fake_ip:
         return jsonify({"success": False, "error": "Domain and fake_ip required"}), 400
-    
+    if not re.match(r"^[a-z0-9\-\.]+$", domain):
+        return jsonify({"success": False, "error": "Invalid domain"}), 400
+    try:
+        ipaddress.ip_address(fake_ip)
+    except ValueError:
+        return jsonify({"success": False, "error": "Invalid fake_ip"}), 400
+
     success, msg = add_dns_spoof_rule(domain, fake_ip)
     return jsonify({"success": success, "message": msg})
 
@@ -2993,20 +3704,30 @@ def api_get_parental_rules():
 @login_required
 def api_add_parental_rule():
     """Add a parental control rule."""
-    data = request.json
+    data = get_json_body()
+    device_mac = str(data.get("device_mac", ""))
+    day_of_week = str(data.get("day_of_week", ""))
+    start_time = str(data.get("start_time", ""))
+    end_time = str(data.get("end_time", ""))
+    action = str(data.get("action", "block"))
+
+    valid_days = {"everyday", "weekdays", "weekends", "monday", "tuesday",
+                  "wednesday", "thursday", "friday", "saturday", "sunday"}
+    if day_of_week not in valid_days:
+        return jsonify({"success": False, "error": "Invalid day_of_week"}), 400
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", start_time) or \
+       not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", end_time):
+        return jsonify({"success": False, "error": "Times must be HH:MM (24h)"}), 400
+    if action not in ("block", "allow"):
+        action = "block"
+
     conn = get_db()
     conn.execute(
         """
         INSERT INTO parental_rules (device_mac, day_of_week, start_time, end_time, action)
         VALUES (?, ?, ?, ?, ?)
     """,
-        (
-            data["device_mac"],
-            data["day_of_week"],
-            data["start_time"],
-            data["end_time"],
-            data.get("action", "block"),
-        ),
+        (device_mac, day_of_week, start_time, end_time, action),
     )
     
     # Log the action
@@ -3109,13 +3830,42 @@ def api_export(fmt):
 @app.route("/api/bandwidth-history")
 @login_required
 def api_bandwidth_history():
-    """Get bandwidth history for charts."""
+    """Get bandwidth history for charts (rates computed from consecutive samples)."""
     conn = get_db()
-    history = conn.execute("""
-        SELECT * FROM bandwidth_log ORDER BY timestamp DESC LIMIT 100
+    rows = conn.execute("""
+        SELECT * FROM bandwidth_log ORDER BY timestamp ASC LIMIT 2000
     """).fetchall()
     conn.close()
-    return jsonify([dict(h) for h in history])
+
+    # Compute per-interface rates between consecutive samples
+    by_iface = defaultdict(list)
+    for r in rows:
+        by_iface[r["interface"]].append(r)
+
+    result = []
+    for iface, samples in by_iface.items():
+        for prev, cur in zip(samples, samples[1:]):
+            try:
+                dt = (
+                    datetime.fromisoformat(cur["timestamp"])
+                    - datetime.fromisoformat(prev["timestamp"])
+                ).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            if dt <= 0:
+                continue
+            dl = max(0, (cur["bytes_recv"] - prev["bytes_recv"])) / dt
+            ul = max(0, (cur["bytes_sent"] - prev["bytes_sent"])) / dt
+            result.append(
+                {
+                    "timestamp": cur["timestamp"],
+                    "interface": iface,
+                    "download_speed": round(dl, 2),
+                    "upload_speed": round(ul, 2),
+                }
+            )
+    result = result[-200:]
+    return jsonify(result)
 
 
 # ============================================================
@@ -3124,25 +3874,36 @@ def api_bandwidth_history():
 if __name__ == "__main__":
     banner = """
 +======================================================================+
-|           NETWORK MANAGER DASHBOARD                                  |
+|           NETWORK ANALYZER — SECURITY AUDITING SUITE                |
 |                                                                      |
 |  Dashboard: http://localhost:5000                                    |
 |                                                                      |
 |  TIP: Run with sudo/admin for full scanning features                |
 |  Press Ctrl+C to stop                                                |
+|                                                                      |
+|  USE ON NETWORKS YOU OWN OR HAVE PERMISSION TO TEST.                 |
 +======================================================================+
     """
     print(banner)
 
     init_db()
 
+    # Clean up ARP spoofing/MITM state on exit (SIGTERM, SIGINT, atexit)
+    atexit.register(cleanup_network_actions)
+    signal.signal(signal.SIGTERM, lambda *a: (cleanup_network_actions(), sys.exit(0)))
+
     # Start background scanner
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
     scanner_thread.start()
 
+    # Start parental-control enforcer
+    parental_thread = threading.Thread(target=parental_enforcer, daemon=True)
+    parental_thread.start()
+
     # Start Flask
     try:
-        app.run(host=APP_HOST, port=APP_PORT, debug=False)
+        app.run(host=APP_HOST, port=APP_PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         scanner_running = False
         print("\n[*] Shutting down...")
+        cleanup_network_actions()

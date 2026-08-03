@@ -28,30 +28,49 @@ A powerful real-time network scanner and management dashboard for your home WiFi
 
 ## Features
 
-- **Device Discovery** — ARP scan to find all devices on your network
+- **Device Discovery** — ARP scan to find all devices on your network (real netmask, not hardcoded /24)
 - **Real-Time Monitoring** — Auto-refreshing dashboard with live data
 - **Device Management** — Name, categorize, and track devices
-- **Bandwidth Monitor** — Real-time upload/download speed charts
+- **Bandwidth Monitor** — Real-time upload/download speed charts + history as true rates
 - **Speed Test** — Built-in internet speed test
 - **Network Map** — Interactive topology visualization
-- **Device Blocking** — Block devices via ARP spoofing (your network only)
-- **Port Scanner** — Scan open ports on any device
-- **Network Messaging** — Send messages to Windows devices
-- **Alerts** — Get notified when new/unknown devices connect
-- **Parental Controls** — Schedule-based device blocking rules
-- **WiFi Info** — SSID, signal strength, channel, security
+- **Device Blocking** — Block devices via ARP spoofing (your network only) + automatic ARP restore on shutdown
+- **Port Scanner** — Scan open ports with service banners, validated ranges, rate limiting
+- **Network Messaging** — Send messages to Windows devices (auth required + CSRF protected)
+- **Alerts** — New/unknown devices, MITM, rogue DHCP, high-threat DNS, bandwidth hogs
+- **Parental Controls** — Schedule-based blocking **actually enforced** by a background scheduler
+- **WiFi Info** — SSID, signal strength, channel, security (Windows/Linux/macOS)
 - **Export** — Download device list as CSV or JSON
-- **OS Fingerprinting** — Guess device OS (Windows/macOS/Linux/iOS/Android) from TTL, TCP window, DHCP hostname
-- **Live Traffic Viewer** — Real-time HTTP hostnames, DNS queries, TLS SNI (no decryption)
-- **MITM Attack Simulator** — Educational ARP spoofing per-device with optional DNS spoof (phishing lab)
-- **DNS Spoof Simulator** — Redirect domains to fake IPs for phishing awareness training
-- **Rogue DHCP Detector** — Detect evil twin DHCP servers on your network
-- **Passive DNS Logger** — Track "Top 5 sites" visited per device
-- **TLS Fingerprinting (JA3)** — Detect malware by TLS client fingerprint without decryption
+- **OS Fingerprinting** — Passive (from traffic) + active (TCP SYN probe) OS detection with confidence score
+- **Live Traffic Viewer** — Real-time HTTP hostnames, DNS queries, TLS SNI (no decryption) with dashboard UI
+- **MITM Attack Simulator** — Educational ARP spoofing per-device with optional DNS spoof (phishing lab) — full UI
+- **DNS Spoof Simulator** — Redirect domains to fake IPs for phishing awareness training — full UI
+- **Rogue DHCP Detector** — Detect evil twin DHCP servers on your network — visible in Security tab
+- **Passive DNS Logger** — Track "Top 5 sites" visited per device (accurate visit counts)
+- **TLS Fingerprinting (JA3)** — **Real JA3 hash computation** from ClientHello (version, ciphers, extensions, curves, point formats)
 - **MITM/ARP Spoof Detector** — Real-time alerts for ARP poisoning attacks
 - **Port Scan History** — Track new open ports over time to catch backdoors
-- **Bandwidth Hog Alerts** — Alert when a device uses >80% bandwidth for 5 minutes
-- **Audit Logging** — Every block/unblock/MITM action logged with timestamp and user
+- **Bandwidth Hog Alerts** — Alert when an interface sustains >80% bandwidth for 5+ minutes (fixed math)
+- **Audit Logging** — Every block/unblock/MITM/parental/scan action logged with timestamp and user — visible in Reports tab
+- **Security Report** — One-page summary of device stats, alerts, and suspicious devices
+- **Per-Device Traffic Estimates** — Bytes/packets per MAC collected from captured traffic
+- **Telegram Alerts** — Optional push notifications for security events
+- **Security hardening** — CSRF protection on all mutations, hashed admin password, login brute-force lockout, session cookie hardening, security headers, input validation, rate limits everywhere
+
+## Configuration (Environment Variables)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SECRET_KEY` | dev-only default (warns) | Flask session signing key |
+| `ADMIN_USERNAME` | `admin` | Admin login name |
+| `ADMIN_PASSWORD` | `admin123` (warns) | Admin password (hashed at startup) |
+| `ADMIN_PASSWORD_HASH` | — | Pre-hashed password (e.g. `werkzeug.security.generate_password_hash` output) |
+| `DB_PATH` | `./network_manager.db` | SQLite database location (honored by Docker) |
+| `APP_PORT` | `5000` | Web port |
+| `SCAN_INTERVAL` | `30` | Auto-scan interval (seconds) |
+| `COOKIE_SECURE` | `0` | Set `1` to only send cookies over HTTPS |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Enable Telegram alert pushes |
+| `RETAIN_*_DAYS` | 7–90 | Data retention windows (alerts, audit, DNS, bandwidth, JA3, ports) |
 
 ## Setup
 
