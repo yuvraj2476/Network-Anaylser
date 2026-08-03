@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Network Manager</title>
+<title>Network Analyzer — Security Auditing Suite</title>
+<meta name="csrf-token" content="{{ csrf_token() }}">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
 <style>
@@ -307,6 +308,8 @@ tr:hover td { background: rgba(0,212,255,0.03); }
     <button class="nav-item" data-section="speedtest"><span class="icon">&#9889;</span> Speed Test</button>
     <button class="nav-item" data-section="wifi-info"><span class="icon">&#128246;</span> WiFi Info</button>
     <button class="nav-item" data-section="security"><span class="icon">&#128274;</span> Security <span class="nav-badge" id="navSecurityCount" style="display:none">0</span></button>
+    <button class="nav-item" data-section="live-traffic"><span class="icon">&#128225;</span> Live Traffic</button>
+    <button class="nav-item" data-section="reports"><span class="icon">&#128203;</span> Reports & Logs</button>
     <button class="nav-item" data-section="alerts"><span class="icon">&#128276;</span> Alerts <span class="nav-badge" id="navAlertCount" style="display:none">0</span></button>
     <button class="nav-item" data-section="parental"><span class="icon">&#128119;</span> Parental Controls</button>
     <button class="nav-item" data-section="tools"><span class="icon">&#128295;</span> Tools</button>
@@ -531,6 +534,87 @@ tr:hover td { background: rgba(0,212,255,0.03); }
         <div id="mitmAlertsList"></div>
         <div id="mitmEmpty" style="text-align:center; padding:20px; color:var(--dim);">No MITM attacks detected</div>
       </div>
+
+      <div class="card">
+        <h3 style="margin-bottom:12px; color:var(--orange);">&#128373; Rogue DHCP (Evil Twin) Detection</h3>
+        <div id="rogueDhcpList"></div>
+      </div>
+    </div>
+
+    <!-- ========== LIVE TRAFFIC ========== -->
+    <div class="section" id="sec-live-traffic">
+      <div class="page-header">
+        <h2>Live Traffic Intelligence</h2>
+        <div class="header-actions">
+          <button class="btn btn-outline" onclick="loadLiveTraffic(); loadPassiveDns(); loadPortHistory();">Refresh All</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>&#128225; Live Traffic (HTTP hosts, DNS queries, TLS SNI — no decryption)</h3>
+          <span style="font-size:12px;color:var(--dim);" id="trafficNote">Requires the packet sniffer to be running</span>
+        </div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%; font-size:12px;">
+            <thead><tr><th>Time</th><th>Type</th><th>Source IP</th><th>Domain</th><th>Details</th></tr></thead>
+            <tbody id="liveTrafficTable"></tbody>
+          </table>
+        </div>
+        <div id="liveTrafficEmpty" style="text-align:center; padding:20px; color:var(--dim);">No traffic captured yet — start the Packet Sniffer in Tools</div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header"><h3>&#128200; Top Domains (Passive DNS)</h3></div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%; font-size:12px;">
+              <thead><tr><th>Device</th><th>Domain</th><th>Visits</th></tr></thead>
+              <tbody id="passiveDnsTable"></tbody>
+            </table>
+          </div>
+          <div id="passiveDnsEmpty" style="text-align:center; padding:20px; color:var(--dim);">No DNS activity logged yet</div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>&#128274; Port Scan History</h3></div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%; font-size:12px;">
+              <thead><tr><th>Time</th><th>IP</th><th>Port</th><th>Service</th><th>Status</th></tr></thead>
+              <tbody id="portHistoryTable"></tbody>
+            </table>
+          </div>
+          <div id="portHistoryEmpty" style="text-align:center; padding:20px; color:var(--dim);">No port scans performed yet</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== REPORTS & LOGS ========== -->
+    <div class="section" id="sec-reports">
+      <div class="page-header">
+        <h2>Reports & Audit Logs</h2>
+        <div class="header-actions">
+          <button class="btn btn-outline" onclick="loadSecurityReport(); loadAuditLog();">Refresh</button>
+          <button class="btn btn-primary" onclick="window.open('/api/export/csv','_blank')">Export Devices CSV</button>
+          <button class="btn btn-outline" onclick="window.open('/api/export/json','_blank')">Export JSON</button>
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-bottom:20px;">
+        <div class="card">
+          <h3 style="margin-bottom:12px;">&#128203; Security Report</h3>
+          <div id="securityReportBody"><div style="color:var(--dim);">Click refresh or open this section to generate.</div></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">&#128274; Audit Log (who did what, when)</h3>
+          <div style="overflow-x:auto; max-height:400px; overflow-y:auto;">
+            <table style="width:100%; font-size:11px;">
+              <thead><tr><th>Time</th><th>Action</th><th>Device</th><th>User</th><th>Details</th></tr></thead>
+              <tbody id="auditLogTable"></tbody>
+            </table>
+          </div>
+          <div id="auditLogEmpty" style="text-align:center; padding:20px; color:var(--dim);">No audit entries yet</div>
+        </div>
+      </div>
     </div>
 
     <!-- ========== ALERTS ========== -->
@@ -616,6 +700,30 @@ tr:hover td { background: rgba(0,212,255,0.03); }
             <textarea id="msgText" rows="3" placeholder="Type your message..." style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); resize:vertical;"></textarea>
           </div>
           <button class="btn btn-primary" onclick="sendMessage()">Send Message</button>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">&#128273; MITM Attack Simulator <span style="font-size:10px;color:var(--orange);">(educational — own network only)</span></h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Demonstrates ARP-spoofing vulnerability. Start a capture to also watch traffic.</p>
+          <div class="form-group">
+            <label>Target Device</label>
+            <select id="mitmTarget" style="width:100%; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);"></select>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="mitmDnsSpoof"> Enable DNS spoofing (only works with rules added below)</label>
+          </div>
+          <button class="btn btn-danger" onclick="startMitm()">Start MITM</button>
+          <button class="btn btn-success" onclick="stopMitm()" style="margin-left:8px;">Stop MITM</button>
+          <div id="activeMitmList" style="margin-top:12px; font-size:12px; color:var(--dim);"></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-bottom:12px;">&#128270; DNS Spoof Rules (Phishing Lab)</h3>
+          <p style="font-size:13px; color:var(--dim); margin-bottom:12px;">Redirect a domain to a fake IP to demonstrate phishing.</p>
+          <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
+            <input type="text" id="spoofDomain" placeholder="example.com" style="flex:1; min-width:120px; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);">
+            <input type="text" id="spoofFakeIp" placeholder="10.0.0.5" style="flex:1; min-width:120px; padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text);">
+            <button class="btn btn-primary" onclick="addDnsSpoofRule()">Add Rule</button>
+          </div>
+          <div id="dnsSpoofRulesList" style="font-size:12px;"></div>
         </div>
         <div class="card">
           <h3 style="margin-bottom:12px;">Export Data</h3>
@@ -729,10 +837,19 @@ const DEVICE_ICONS = {
 };
 
 // ============ API ============
+function getCsrfToken() {
+  const meta = document.querySelector('meta[name="csrf-token"]');
+  return meta ? meta.content : '';
+}
+
 async function api(url, opts = {}) {
   try {
+    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+    if (opts.method && opts.method !== 'GET' && opts.method !== 'HEAD') {
+      headers['X-CSRF-Token'] = getCsrfToken();
+    }
     const res = await fetch(url, {
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       ...opts,
       body: opts.body ? JSON.stringify(opts.body) : undefined
     });
@@ -819,43 +936,334 @@ async function loadWifiInfo() {
   }
   
   // Load WiFi security info
-  loadWifiSecurity();
+  refreshWifiSecurity();
 }
 
-async function loadWifiSecurity() {
+// ============ SECURITY TAB ============
+async function loadDnsQueries() {
+  const data = await api('/api/dns-queries?limit=50&min_threat=20');
+  const tbody = document.getElementById('dnsQueriesTable');
+  const empty = document.getElementById('dnsQueriesEmpty');
+  const threatCount = document.getElementById('dnsThreatCount');
+  const totalCount = document.getElementById('totalDnsQueries');
+
+  const all = await api('/api/dns-queries?limit=1');
+  const allData = await api('/api/dns-queries?limit=200');
+  if (totalCount && allData) totalCount.textContent = allData.length;
+
+  const suspicious = (data || []).filter(q => q.threat_score >= 50);
+  if (threatCount) threatCount.textContent = suspicious.length;
+
+  if (!data || data.length === 0) {
+    if (tbody) tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (tbody) {
+    tbody.innerHTML = data.map(q => `
+      <tr>
+        <td>${timeAgo(q.timestamp)}</td>
+        <td style="font-family:monospace;">${escHtml(q.source_ip)}</td>
+        <td style="font-family:monospace;color:${q.threat_score >= 50 ? 'var(--red)' : 'var(--orange)'};">${escHtml(q.query_name)}</td>
+        <td>${escHtml(q.query_type)}</td>
+        <td style="font-weight:700;color:${q.threat_score >= 50 ? 'var(--red)' : 'var(--yellow)'};">${q.threat_score}</td>
+        <td>${escHtml(q.threat_category)}</td>
+      </tr>`).join('');
+  }
+}
+
+async function loadJa3Fingerprints() {
+  const data = await api('/api/ja3-fingerprints?limit=50&suspicious=true');
+  const tbody = document.getElementById('ja3Table');
+  const empty = document.getElementById('ja3Empty');
+  const count = document.getElementById('ja3MalwareCount');
+  if (count) count.textContent = (data || []).filter(f => f.matched_malware).length;
+
+  if (!data || data.length === 0) {
+    if (tbody) tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (tbody) {
+    tbody.innerHTML = data.map(f => `
+      <tr>
+        <td>${timeAgo(f.timestamp)}</td>
+        <td style="font-family:monospace;">${escHtml(f.source_ip)}</td>
+        <td style="font-family:monospace;font-size:11px;">${escHtml(f.ja3_hash)}</td>
+        <td style="color:${f.matched_malware ? 'var(--red)' : 'var(--dim)'};font-weight:600;">${f.matched_malware || '—'}</td>
+        <td style="color:${f.matched_malware ? 'var(--red)' : 'var(--accent2)'};">${f.matched_malware ? 'SUSPICIOUS' : 'OK'}</td>
+      </tr>`).join('');
+  }
+}
+
+async function loadMitmAlerts() {
+  const data = await api('/api/mitm-alerts?limit=50');
+  const el = document.getElementById('mitmAlertsList');
+  const empty = document.getElementById('mitmEmpty');
+  const count = document.getElementById('mitmAttackCount');
+  if (count) count.textContent = (data || []).length;
+
+  if (!data || data.length === 0) {
+    if (el) el.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (el) {
+    el.innerHTML = data.map(a => `
+      <div class="alert-item">
+        <span class="alert-dot" style="background:var(--red);"></span>
+        <span style="font-size:12px;">${escHtml(a.alert)}</span>
+        <span class="alert-time">${timeAgo(a.timestamp)}</span>
+      </div>`).join('');
+  }
+}
+
+async function loadRogueDhcpAlerts() {
+  const data = await api('/api/rogue-dhcp-alerts?limit=20');
+  const el = document.getElementById('rogueDhcpList');
+  if (!el) return;
+  if (!data || data.length === 0) {
+    el.innerHTML = '<div style="padding:12px;color:var(--dim);text-align:center;">No rogue DHCP servers detected</div>';
+    return;
+  }
+  el.innerHTML = data.map(a => `
+    <div class="alert-item">
+      <span class="alert-dot" style="background:var(--red);"></span>
+      <span style="font-size:12px;"><strong>${escHtml(a.message_type)}</strong> from ${escHtml(a.rogue_ip)} (${escHtml(a.rogue_mac)}) offering ${escHtml(a.offered_server)}</span>
+      <span class="alert-time">${timeAgo(a.timestamp)}</span>
+    </div>`).join('');
+}
+
+async function refreshWifiSecurity() {
   const data = await api('/api/wifi/security');
   if (!data) return;
-  
   const wifi = data.wifi || {};
   const security = data.security || {};
-  
   const el = document.getElementById('wifiSecurityInfo');
+  if (!el) return;
   let html = '';
-  
-  // Encryption info
-  html += `<div style="margin-bottom:8px;"><strong>Encryption:</strong> ${security.encryption || 'Unknown'}</div>`;
-  
-  // WPS info
-  html += `<div style="margin-bottom:8px;"><strong>WPS:</strong> ${security.wps || 'Unknown'}</div>`;
-  
-  // Hidden SSID
+  html += `<div style="margin-bottom:8px;"><strong>Encryption:</strong> ${escHtml(security.encryption || 'Unknown')}</div>`;
+  html += `<div style="margin-bottom:8px;"><strong>WPS:</strong> ${escHtml(security.wps || 'Unknown')}</div>`;
   html += `<div style="margin-bottom:8px;"><strong>Hidden SSID:</strong> ${security.hidden_ssid ? 'Yes' : 'No'}</div>`;
-  
-  // MAC Filtering
-  html += `<div style="margin-bottom:8px;"><strong>MAC Filtering:</strong> ${security.mac_filtering || 'Unknown'}</div>`;
-  
-  // Recommendations
+  html += `<div style="margin-bottom:8px;"><strong>MAC Filtering:</strong> ${escHtml(security.mac_filtering || 'Unknown')}</div>`;
   if (security.recommendations && security.recommendations.length > 0) {
     html += `<div style="margin-bottom:8px;"><strong>Recommendations:</strong></div><ul>`;
     security.recommendations.forEach(rec => {
-      html += `<li style="color:var(--orange); font-size:12px;">${rec}</li>`;
+      html += `<li style="color:var(--orange); font-size:12px;">${escHtml(rec)}</li>`;
     });
     html += '</ul>';
   } else {
     html += `<div style="margin-bottom:8px;"><strong>Recommendations:</strong> No security issues detected</div>`;
   }
-  
   el.innerHTML = html;
+}
+
+function loadAllSecurity() {
+  loadDnsQueries();
+  loadJa3Fingerprints();
+  loadMitmAlerts();
+  loadRogueDhcpAlerts();
+}
+
+// ============ DEVICE FINGERPRINTING ============
+async function fingerprintDevice(mac) {
+  const result = await api(`/api/devices/${mac}/fingerprint`, { method: 'POST' });
+  if (result?.success) {
+    toast(`OS fingerprint: ${result.os_guess} (${result.os_confidence}%) — TTL ${result.ttl}, window ${result.tcp_window_size}`, 'success');
+    loadDevices();
+  } else {
+    toast(result?.error || 'Fingerprint failed (device offline or no root)', 'error');
+  }
+}
+
+// ============ LIVE TRAFFIC / PASSIVE DNS / PORT HISTORY ============
+async function loadLiveTraffic() {
+  const data = await api('/api/live-traffic?limit=100');
+  const tbody = document.getElementById('liveTrafficTable');
+  const empty = document.getElementById('liveTrafficEmpty');
+  if (!tbody) return;
+  if (!data || data.length === 0) {
+    tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  tbody.innerHTML = data.map(t => `
+    <tr>
+      <td>${timeAgo(t.timestamp)}</td>
+      <td><span style="color:${t.type === 'DNS' ? 'var(--orange)' : t.type === 'HTTP' ? 'var(--accent)' : 'var(--purple)'};font-weight:600;">${escHtml(t.type)}</span></td>
+      <td style="font-family:monospace;">${escHtml(t.source_ip)}</td>
+      <td style="font-family:monospace;">${escHtml(t.domain)}</td>
+      <td style="font-size:11px;color:var(--dim);">${escHtml(t.details)}</td>
+    </tr>`).join('');
+}
+
+async function loadPassiveDns() {
+  const data = await api('/api/passive-dns?limit=30');
+  const tbody = document.getElementById('passiveDnsTable');
+  const empty = document.getElementById('passiveDnsEmpty');
+  if (!tbody) return;
+  if (!data || data.length === 0) {
+    tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  tbody.innerHTML = data.map(r => {
+    const dev = devices.find(d => d.mac === r.source_mac);
+    const name = dev ? (dev.custom_name || dev.hostname || dev.ip) : (r.source_mac || '—');
+    return `<tr>
+      <td>${escHtml(name)}</td>
+      <td style="font-family:monospace;">${escHtml(r.domain)}</td>
+      <td style="font-weight:700;color:var(--accent);">${r.total_visits}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadPortHistory() {
+  const data = await api('/api/port-history?limit=50&new_only=true');
+  const tbody = document.getElementById('portHistoryTable');
+  const empty = document.getElementById('portHistoryEmpty');
+  if (!tbody) return;
+  if (!data || data.length === 0) {
+    tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  tbody.innerHTML = data.map(r => `
+    <tr>
+      <td>${timeAgo(r.first_seen)}</td>
+      <td style="font-family:monospace;">${escHtml(r.device_ip)}</td>
+      <td style="font-family:monospace;font-weight:700;color:var(--orange);">${r.port}</td>
+      <td>${escHtml(r.service)}</td>
+      <td><span style="color:${r.is_new ? 'var(--red)' : 'var(--dim)'};">${r.is_new ? 'NEW' : 'known'}</span></td>
+    </tr>`).join('');
+}
+
+// ============ REPORTS & AUDIT ============
+async function loadSecurityReport() {
+  const data = await api('/api/security-report');
+  const el = document.getElementById('securityReportBody');
+  if (!el || !data) return;
+  const s = data.summary || {};
+  const alerts = data.recent_alerts || [];
+  const suspicious = data.suspicious_devices || [];
+  let html = `
+    <div class="stats-grid" style="margin-bottom:12px;">
+      <div class="stat-card blue"><div class="stat-label">Total</div><div class="stat-value" style="font-size:22px;">${s.total_devices ?? 0}</div></div>
+      <div class="stat-card green"><div class="stat-label">Online</div><div class="stat-value" style="font-size:22px;">${s.online_devices ?? 0}</div></div>
+      <div class="stat-card red"><div class="stat-label">Blocked</div><div class="stat-value" style="font-size:22px;">${s.blocked_devices ?? 0}</div></div>
+      <div class="stat-card orange"><div class="stat-label">Unknown</div><div class="stat-value" style="font-size:22px;">${s.unknown_devices ?? 0}</div></div>
+    </div>`;
+  html += `<div style="font-size:12px;color:var(--dim);margin-bottom:8px;">Generated ${new Date(data.timestamp).toLocaleString()}</div>`;
+  html += `<div style="font-size:13px;font-weight:600;margin:10px 0 6px;">Recent Alerts (${alerts.length})</div>`;
+  if (alerts.length) {
+    html += alerts.slice(0, 10).map(a => `<div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border);">${timeAgo(a.timestamp)} — ${escHtml(a.message)}</div>`).join('');
+  } else {
+    html += '<div style="font-size:12px;color:var(--dim);">No recent alerts</div>';
+  }
+  html += `<div style="font-size:13px;font-weight:600;margin:10px 0 6px;">Suspicious / Unknown Devices (${suspicious.length})</div>`;
+  if (suspicious.length) {
+    html += suspicious.slice(0, 10).map(d => `<div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border);">${escHtml(d.custom_name || d.hostname || d.ip)} (${d.ip}) ${d.is_blocked ? '<span style="color:var(--red);">BLOCKED</span>' : '<span style="color:var(--orange);">UNKNOWN</span>'}</div>`).join('');
+  } else {
+    html += '<div style="font-size:12px;color:var(--dim);">No suspicious devices</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function loadAuditLog() {
+  const data = await api('/api/audit-log?limit=100');
+  const tbody = document.getElementById('auditLogTable');
+  const empty = document.getElementById('auditLogEmpty');
+  if (!tbody) return;
+  if (!data || data.length === 0) {
+    tbody.innerHTML = '';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  tbody.innerHTML = data.map(e => `
+    <tr>
+      <td>${timeAgo(e.timestamp)}</td>
+      <td style="color:var(--accent);font-weight:600;">${escHtml(e.action_type)}</td>
+      <td style="font-family:monospace;font-size:11px;">${escHtml(e.device_ip || e.device_mac || '—')}</td>
+      <td>${escHtml(e.user || '—')}</td>
+      <td style="font-size:11px;color:var(--dim);">${escHtml(e.details)}</td>
+    </tr>`).join('');
+}
+
+// ============ MITM SIMULATOR ============
+async function loadActiveMitm() {
+  const data = await api('/api/active-mitm');
+  const el = document.getElementById('activeMitmList');
+  if (!el) return;
+  if (!data || data.length === 0) {
+    el.innerHTML = 'No active MITM sessions';
+    return;
+  }
+  el.innerHTML = data.map(a =>
+    `<div>🎯 ${a.target_ip} — active: <strong style="color:${a.active ? 'var(--red)' : 'var(--dim)'};">${a.active ? 'RUNNING' : 'stopped'}</strong>${a.dns_spoof_enabled ? ' (DNS spoof ON)' : ''}</div>`
+  ).join('');
+}
+
+async function startMitm() {
+  const mac = document.getElementById('mitmTarget').value;
+  if (!mac || mac === 'No devices found') { toast('Select a target device', 'error'); return; }
+  if (!confirm('Start MITM attack simulation on this device? Educational use only — your network, with permission.')) return;
+  const result = await api(`/api/devices/${mac}/start-mitm`, {
+    method: 'POST',
+    body: { dns_spoof: document.getElementById('mitmDnsSpoof').checked }
+  });
+  if (result?.success) { toast(result.message, 'success'); loadActiveMitm(); }
+  else toast(result?.message || 'Failed', 'error');
+}
+
+async function stopMitm() {
+  const mac = document.getElementById('mitmTarget').value;
+  if (!mac) return;
+  const result = await api(`/api/devices/${mac}/stop-mitm`, { method: 'POST' });
+  if (result?.success) { toast(result.message, 'success'); loadActiveMitm(); }
+  else toast(result?.message || 'Failed', 'error');
+}
+
+// ============ DNS SPOOF RULES ============
+async function loadDnsSpoofRules() {
+  const data = await api('/api/dns-spoof-rules');
+  const el = document.getElementById('dnsSpoofRulesList');
+  if (!el) return;
+  if (!data || data.length === 0) {
+    el.innerHTML = '<div style="color:var(--dim);">No spoof rules. Add one above.</div>';
+    return;
+  }
+  el.innerHTML = data.map(r => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);">
+      <span style="font-family:monospace;">${escHtml(r.domain)} → <span style="color:var(--orange);">${escHtml(r.fake_ip)}</span></span>
+      <button class="btn btn-sm btn-danger" onclick="deleteDnsSpoofRule('${encodeURIComponent(r.domain)}')">Delete</button>
+    </div>`).join('');
+}
+
+async function addDnsSpoofRule() {
+  const domain = document.getElementById('spoofDomain').value.trim();
+  const fakeIp = document.getElementById('spoofFakeIp').value.trim();
+  if (!domain || !fakeIp) { toast('Enter domain and fake IP', 'error'); return; }
+  const result = await api('/api/dns-spoof-rules', { method: 'POST', body: { domain, fake_ip: fakeIp } });
+  if (result?.success) {
+    toast(result.message, 'success');
+    document.getElementById('spoofDomain').value = '';
+    document.getElementById('spoofFakeIp').value = '';
+    loadDnsSpoofRules();
+  } else {
+    toast(result?.error || 'Failed', 'error');
+  }
+}
+
+async function deleteDnsSpoofRule(domain) {
+  await api(`/api/dns-spoof-rules/${domain}`, { method: 'DELETE' });
+  loadDnsSpoofRules();
 }
 
 // ============ RENDERING ============
@@ -879,6 +1287,13 @@ function renderDevices() {
     const statusClass = d.is_blocked ? 'blocked-badge' : (d.is_online ? 'online' : 'offline');
     const statusText = d.is_blocked ? 'BLOCKED' : (d.is_online ? 'Online' : 'Offline');
     const ago = timeAgo(d.last_seen);
+    const osBadge = d.os_guess && d.os_guess !== 'Unknown'
+      ? `<div style="margin-top:6px;"><span class="label">OS: </span><span class="val" style="color:var(--accent);">${escHtml(d.os_guess)} (${d.os_confidence}%)</span></div>`
+      : '';
+    const trafficBytes = d.traffic_bytes ? formatBytes(d.traffic_bytes) : null;
+    const trafficBadge = trafficBytes
+      ? `<div><span class="label">Traffic: </span><span class="val" style="color:var(--orange);">${trafficBytes}</span></div>`
+      : '';
     return `
       <div class="device-card ${d.is_blocked ? 'blocked' : ''}">
         <div class="device-status ${statusClass}">${statusText}</div>
@@ -894,9 +1309,12 @@ function renderDevices() {
           <div><span class="label">Vendor: </span><span class="val">${escHtml(d.vendor)}</span></div>
           <div><span class="label">Type: </span><span class="val">${d.device_type}</span></div>
           <div><span class="label">Last seen: </span><span class="val">${ago}</span></div>
+          ${trafficBadge}
         </div>
-        <div class="device-actions">
+        ${osBadge}
+        <div class="device-actions" style="margin-top:10px;">
           <button class="btn btn-sm btn-outline" onclick="editDevice('${d.mac}')">Edit</button>
+          <button class="btn btn-sm btn-outline" onclick="fingerprintDevice('${d.mac}')">Fingerprint OS</button>
           ${d.is_blocked
             ? `<button class="btn btn-sm btn-success" onclick="unblockDevice('${d.mac}')">Unblock</button>`
             : `<button class="btn btn-sm btn-danger" onclick="blockDevice('${d.mac}')">Block</button>`
@@ -984,7 +1402,7 @@ function populateDeviceSelects() {
     return `<option value="${d.mac}">${escHtml(name)} (${d.ip})</option>`;
   }).join('');
 
-  ['portScanTarget', 'msgTarget', 'parentalDevice', 'vulnScanTarget'].forEach(id => {
+  ['portScanTarget', 'msgTarget', 'parentalDevice', 'vulnScanTarget', 'mitmTarget'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.innerHTML = options || '<option>No devices found</option>';
   });
@@ -1448,9 +1866,13 @@ function switchSection(name) {
   if (name === 'network-map') renderNetworkMap();
   if (name === 'wifi-info') {
     loadWifiInfo();
-    loadWifiSecurity();
+    refreshWifiSecurity();
   }
+  if (name === 'security') loadAllSecurity();
+  if (name === 'live-traffic') { loadLiveTraffic(); loadPassiveDns(); loadPortHistory(); }
+  if (name === 'reports') { loadSecurityReport(); loadAuditLog(); }
   if (name === 'parental') loadParentalRules();
+  if (name === 'tools') { loadActiveMitm(); loadDnsSpoofRules(); }
   document.querySelector('.sidebar').classList.remove('open');
 }
 
@@ -1512,6 +1934,9 @@ setInterval(() => {
   loadStats();
   loadDevices();
   loadAlerts();
+  loadAllSecurity();
+  loadLiveTraffic();
+  loadActiveMitm();
 }, 30000);
 </script>
 </body>

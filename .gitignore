@@ -1,1 +1,29 @@
-Nothing should be ignored based on the provided file changes, as they only include source/config files (.md and .py) without any build artifacts, dependencies, or temporary files.
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Database & data
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
