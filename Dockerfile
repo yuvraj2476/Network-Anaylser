@@ -2,27 +2,26 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for scapy
+# System deps: wireless tools + packet capture + go (optional - for subfinder/assetfinder/httpx)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tcpdump \
-    iproute2 \
-    net-tools \
+    tcpdump iw wireless-tools iproute2 net-tools wireless-regdb \
+    procps curl iputils-ping wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
 COPY network_manager.py .
 COPY templates/ ./templates/
+COPY docs/ ./docs/
 
-# Expose the Flask port
-EXPOSE 5000
+RUN mkdir -p /app/pcaps /app/data
 
-# Set environment variables
+ENV DB_PATH=/app/data/network_manager.db
+ENV PCAP_DIR=/app/pcaps
 ENV FLASK_APP=network_manager.py
 ENV PYTHONUNBUFFERED=1
 
-# Run the application
+EXPOSE 5000
+
 CMD ["python", "network_manager.py"]

@@ -1,177 +1,104 @@
-# Network-Analyzer
+# 🔒 Network Analyzer — Security Auditing Suite
 
-A powerful real-time network scanner and management dashboard for your home WiFi. Analyzes the whole network to see which devices are connected and many more features.
+A self-hosted Flask dashboard for auditing your own WiFi / LAN: device discovery,
+bandwidth, port/vuln scanning, WiFi audit (monitor mode, handshakes, evil-twin,
+hashcat 22000 export), one-click recon (subdomains, TLS, deep-web admin-page hunter),
+a bug-bounty module with multi-source enumeration + allowlisted command runner, and
+an AI Brain with optional LLM integration.
 
-![Demo](docs/demo.gif)
-
-## Quick Start
-
-```bash
-# Option 1: Run with Docker (recommended)
-docker-compose up
-
-# Option 2: Run directly
-pip install -r requirements.txt
-sudo python3 network_manager.py
-```
-
-Open http://localhost:5000 in your browser.
-
----
-
-# Network Manager Dashboard
-
-A powerful real-time network scanner and management dashboard for your home WiFi.
-
-![Python](https://img.shields.io/badge/Python-3.8+-blue)
-![Flask](https://img.shields.io/badge/Flask-3.0+-green)
+> ⚠️ **Only use on networks you own or have explicit written permission to test.**
+> Offensive features (deauth, ARP block, MITM, DNS spoof, recon/bug-bounty) are
+> confirm-gated and audit-logged.
 
 ## Features
 
-- **Device Discovery** — ARP scan to find all devices on your network (real netmask, not hardcoded /24)
-- **Real-Time Monitoring** — Auto-refreshing dashboard with live data
-- **Device Management** — Name, categorize, and track devices
-- **Bandwidth Monitor** — Real-time upload/download speed charts + history as true rates
-- **Speed Test** — Built-in internet speed test
-- **Network Map** — Interactive topology visualization
-- **Device Blocking** — Block devices via ARP spoofing (your network only) + automatic ARP restore on shutdown
-- **Port Scanner** — Scan open ports with service banners, validated ranges, rate limiting
-- **Network Messaging** — Send messages to Windows devices (auth required + CSRF protected)
-- **Alerts** — New/unknown devices, MITM, rogue DHCP, high-threat DNS, bandwidth hogs
-- **Parental Controls** — Schedule-based blocking **actually enforced** by a background scheduler
-- **WiFi Info** — SSID, signal strength, channel, security (Windows/Linux/macOS)
-- **Export** — Download device list as CSV or JSON
-- **OS Fingerprinting** — Passive (from traffic) + active (TCP SYN probe) OS detection with confidence score
-- **Live Traffic Viewer** — Real-time HTTP hostnames, DNS queries, TLS SNI (no decryption) with dashboard UI
-- **MITM Attack Simulator** — Educational ARP spoofing per-device with optional DNS spoof (phishing lab) — full UI
-- **DNS Spoof Simulator** — Redirect domains to fake IPs for phishing awareness training — full UI
-- **Rogue DHCP Detector** — Detect evil twin DHCP servers on your network — visible in Security tab
-- **Passive DNS Logger** — Track "Top 5 sites" visited per device (accurate visit counts)
-- **TLS Fingerprinting (JA3)** — **Real JA3 hash computation** from ClientHello (version, ciphers, extensions, curves, point formats)
-- **MITM/ARP Spoof Detector** — Real-time alerts for ARP poisoning attacks
-- **Port Scan History** — Track new open ports over time to catch backdoors
-- **Bandwidth Hog Alerts** — Alert when an interface sustains >80% bandwidth for 5+ minutes (fixed math)
-- **Audit Logging** — Every block/unblock/MITM/parental/scan action logged with timestamp and user — visible in Reports tab
-- **Security Report** — One-page summary of device stats, alerts, and suspicious devices
-- **Per-Device Traffic Estimates** — Bytes/packets per MAC collected from captured traffic
-- **Telegram Alerts** — Optional push notifications for security events
-- **Security hardening** — CSRF protection on all mutations, hashed admin password, login brute-force lockout, session cookie hardening, security headers, input validation, rate limits everywhere
+- 🛰 **Device discovery** (ARP + ping fallback), passive OS fingerprinting,
+  vendor lookup, custom labels / known-device flag.
+- 📶 **Bandwidth monitor** per interface with hog detection (sustained >80% alerting)
+  and historical charts.
+- 🔌 **Port scanner** – Connect / SYN-stealth / UDP, 80-service DB with regex
+  version fingerprinting.
+- 🧬 **TLS / JA3** fingerprinting with malware-JA3 blocklist and x509 inspection.
+- 🛡️ **Security** – CSRF (session tokens, `/login` exempt for proxied-previews),
+  brute-force lockout, security headers, rate limits, audit log, optional Telegram alerts.
+- 📡 **WiFi audit** (Linux only) – monitor mode (airmon-ng / iw), site survey,
+  channel hopping, evil-twin detection, deauth lab, WPA handshake capture with
+  **hashcat `-m 22000`** export, PMKID extraction.
+- 🔍 **Recon** – subdomain enumeration (crt.sh + wordlist + subfinder/assetfinder/amass),
+  open-port sweep, HTTP/TLS fetch + tech fingerprint, optional VirusTotal,
+  deep-web scan over ~370 admin/secret paths.
+- 🎯 **Bug Bounty** – target scoping, multi-source enum, httpx-style concurrent probing,
+  allowlisted streamed command runner (subfinder/assetfinder/amass/httpx/ffuf/nmap/dig/whois/curl).
+- 🧠 **AI Brain** – offline intent engine (no API key) plus optional OpenAI-compatible
+  / Ollama LLM analyst.
+- ⚙️ **Settings UI** with masked API keys and one-click tool installer (apt / go).
 
-## Configuration (Environment Variables)
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SECRET_KEY` | dev-only default (warns) | Flask session signing key |
-| `ADMIN_USERNAME` | `admin` | Admin login name |
-| `ADMIN_PASSWORD` | `admin123` (warns) | Admin password (hashed at startup) |
-| `ADMIN_PASSWORD_HASH` | — | Pre-hashed password (e.g. `werkzeug.security.generate_password_hash` output) |
-| `DB_PATH` | `./network_manager.db` | SQLite database location (honored by Docker) |
-| `APP_PORT` | `5000` | Web port |
-| `SCAN_INTERVAL` | `30` | Auto-scan interval (seconds) |
-| `COOKIE_SECURE` | `0` | Set `1` to only send cookies over HTTPS |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Enable Telegram alert pushes |
-| `RETAIN_*_DAYS` | 7–90 | Data retention windows (alerts, audit, DNS, bandwidth, JA3, ports) |
-
-## Setup
-
-### Option 1: Docker (Recommended)
-
-```bash
-docker-compose up
-```
-
-### Option 2: Manual Install
-
-### 1. Install Python 3.8+
-
-Download from https://python.org if you don't have it.
-
-### 2. Install Dependencies
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 3. Run the Dashboard
-
-**Linux / macOS** (sudo required for ARP scanning):
-```bash
 sudo python3 network_manager.py
+# Open http://localhost:5000  (default login: admin / admin123 — CHANGE IT!)
 ```
 
-**Windows** (run as Administrator):
+### Docker
+
 ```bash
-python network_manager.py
+docker compose up --build
+# Capabilities NET_RAW + NET_ADMIN are needed for ARP/SYN scanning and WiFi.
 ```
 
-### 4. Open Dashboard
+## Environment variables
 
-Open your browser and go to:
+| Variable | Default | Purpose |
+|---|---|---|
+| `ADMIN_USERNAME` | `admin` | Dashboard username |
+| `ADMIN_PASSWORD` | `admin123` | Dashboard password (hashed in memory on boot) |
+| `ADMIN_PASSWORD_HASH` | _(optional)_ | Pre-hashed Werkzeug password; overrides `ADMIN_PASSWORD` |
+| `SECRET_KEY` | _insecure default_ | Flask session secret — **set this in production** |
+| `APP_HOST` | `0.0.0.0` | Bind address |
+| `APP_PORT` | `5000` | Bind port |
+| `DB_PATH` | `./network_manager.db` | SQLite path |
+| `PCAP_DIR` | `./pcaps` | Handshake PCAP output dir |
+| `SCAN_INTERVAL` | `30` | Seconds between auto ARP scans |
+| `COOKIE_SECURE` | `0` | Set `Secure` flag on session cookie |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Optional alert notifications |
+| `VT_API_KEY` | — | VirusTotal key (also editable in Settings) |
+| Retention (`RETAIN_ALERTS_DAYS`, `RETAIN_AUDIT_DAYS`, `RETAIN_DNS_DAYS`, `RETAIN_BW_DAYS`, `RETAIN_JA3_DAYS`, `RETAIN_PORT_DAYS`, `RETAIN_WIFI_DAYS`) | defaults 7–90 | Log retention windows |
+
+## Dashboard sections (12)
+
+1. Overview – stats + bandwidth / device-type charts + recent alerts
+2. Devices – inventory, labels, block/unblock, port/vuln scan, OS fingerprint
+3. Network Map – vis.js graph of gateway and devices
+4. Bandwidth – live rates, history, speed test
+5. WiFi Audit & Lab – monitor mode, survey, handshakes, event log
+6. Recon – one-click recon + deep-web + TLS check
+7. Bug Bounty – targets, enum, live-host probe, allowlisted command runner
+8. Security – alerts, MITM/rogue-DHCP, JA3, DNS threats, audit log
+9. Live Traffic / PCAP – HTTP/DNS/TLS SNI viewer, packet capture
+10. AI Brain – offline assistant + optional LLM
+11. Settings & Tools – key/value settings, external tool install
+12. Reports – security report, passive DNS, port-history
+
+## Default login: `admin` / `admin123`
+
+Set `ADMIN_PASSWORD` (or `ADMIN_PASSWORD_HASH`) and `SECRET_KEY` before
+exposing this to anything outside localhost.
+
+## Project layout
+
 ```
-http://localhost:5000
+network_manager.py   # Main Flask app (~4,900 LOC, 233 functions, 75+ routes)
+templates/
+  login.html         # CSRF-protected login
+  dashboard.html     # 12-section SPA-style UI with Chart.js + vis.js + CDN fallback
+docs/
+  CODE_AUDIT.md      # Security audit notes from PR #5
+  HANDOFF.md         # Batch-by-batch handoff spec
+Dockerfile, docker-compose.yml, requirements.txt, .gitignore
 ```
-
-## Requirements
-
-| Package | Purpose |
-|---------|---------|
-| flask | Web dashboard server |
-| scapy | ARP network scanning |
-| psutil | System/network stats |
-| speedtest-cli | Internet speed test |
-| mac-vendor-lookup | Identify device manufacturers |
-
-## How It Works
-
-1. **ARP Scanning** — Sends ARP requests to discover all devices on your local network
-2. **Background Scanner** — Automatically scans every 30 seconds
-3. **SQLite Database** — Stores device history, alerts, and settings locally
-4. **Web Dashboard** — Flask serves a modern dark-themed dashboard
-
-## Controls
-
-| Key | Description |
-|-----|-------------|
-| Arrow Keys / WASD | Navigate |
-| Scan Button | Trigger manual network scan |
-| Block/Unblock | Control device network access |
-| Edit | Rename and categorize devices |
-
-## Important Notes
-
-- **Run as root/admin** — ARP scanning requires elevated privileges
-- **Use on YOUR network only** — Only use on networks you own or have permission to test
-- **Device blocking** uses ARP spoofing — this is for educational/home use only
-- **Firewall** — You may need to allow Python through your firewall
-- If scapy isn't available, it falls back to ping-based scanning (limited)
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| "Permission denied" | Run with `sudo` (Linux/Mac) or as Administrator (Windows) |
-| No devices found | Check you're connected to WiFi, try manual scan |
-| Scapy import error | `pip install scapy` — on Windows also install Npcap |
-| Speed test fails | `pip install speedtest-cli` |
-| Port 5000 in use | Edit `APP_PORT` in network_manager.py |
-
-## Tech Stack
-
-- Python 3 + Flask (backend)
-- Scapy (network scanning)
-- Chart.js (bandwidth charts)
-- vis.js (network map)
-- SQLite (local database)
-- Vanilla JS (frontend)
 
 ## License
 
-MIT License — See [LICENSE](LICENSE) for details.
-
-### Disclaimer
-
-**For educational purposes only.** This tool is designed for learning about network security and monitoring your own networks. 
-
-- Only use on networks you own or have explicit permission to test
-- Unauthorized network scanning may be illegal in your jurisdiction
-- The authors are not responsible for any misuse of this software
+MIT — see `LICENSE`.
