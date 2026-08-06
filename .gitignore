@@ -11,6 +11,10 @@ env/
 *.db-shm
 *.db-wal
 data/
+pcaps/
+
+# Test artifacts
+/tests/tmp/
 
 # Environment
 .env

@@ -3,8 +3,9 @@
 A self-hosted Flask dashboard for auditing your own WiFi / LAN: device discovery,
 bandwidth, port/vuln scanning, WiFi audit (monitor mode, handshakes, evil-twin,
 hashcat 22000 export), one-click recon (subdomains, TLS, deep-web admin-page hunter),
-a bug-bounty module with multi-source enumeration + allowlisted command runner, and
-an AI Brain with optional LLM integration.
+a bug-bounty module with multi-source enumeration + allowlisted command runner, an
+AI Brain with optional LLM integration — and **Pro Recon**: a one-click
+attack-surface pipeline with risk scoring, snapshot diffing and report export.
 
 > ⚠️ **Only use on networks you own or have explicit written permission to test.**
 > Offensive features (deauth, ARP block, MITM, DNS spoof, recon/bug-bounty) are
@@ -27,8 +28,20 @@ an AI Brain with optional LLM integration.
 - 🔍 **Recon** – subdomain enumeration (crt.sh + wordlist + subfinder/assetfinder/amass),
   open-port sweep, HTTP/TLS fetch + tech fingerprint, optional VirusTotal,
   deep-web scan over ~370 admin/secret paths.
+- ⚡ **Pro Recon (one-click)** – one button chains: DNS intelligence
+  (A/AAAA/MX/NS/TXT/SOA/CAA + PTR) → subdomain enum → port sweep → HTTP/TLS
+  fingerprinting → **security-header grading (A+–F)** → **subdomain-takeover
+  detection** (27-service dangling-CNAME fingerprints) → **lookalike-domain radar**
+  (typo/homoglyph permutations, resolved + probed) → **keyless RDAP WHOIS + IP intel**
+  → **risk-score engine (0–100, prioritized fixes)** → **attack-surface snapshot
+  with 12-char DNA fingerprint + diff ("Time Machine")** → **attack-path graph**
+  → **HTML report export**. Live phase chips + streaming terminal in the UI.
+- 🪤 **Vantage-point canary** – detects transparent proxies/tarpits lying about
+  open ports (random closed-canary check) and flags the sweep as unreliable
+  instead of reporting 100/100 false positives.
 - 🎯 **Bug Bounty** – target scoping, multi-source enum, httpx-style concurrent probing,
-  allowlisted streamed command runner (subfinder/assetfinder/amass/httpx/ffuf/nmap/dig/whois/curl).
+  allowlisted streamed command runner (subfinder/assetfinder/amass/httpx/ffuf/nmap/
+  nuclei/katana/dig/whois/curl).
 - 🧠 **AI Brain** – offline intent engine (no API key) plus optional OpenAI-compatible
   / Ollama LLM analyst.
 - ⚙️ **Settings UI** with masked API keys and one-click tool installer (apt / go).
@@ -66,20 +79,55 @@ docker compose up --build
 | `VT_API_KEY` | — | VirusTotal key (also editable in Settings) |
 | Retention (`RETAIN_ALERTS_DAYS`, `RETAIN_AUDIT_DAYS`, `RETAIN_DNS_DAYS`, `RETAIN_BW_DAYS`, `RETAIN_JA3_DAYS`, `RETAIN_PORT_DAYS`, `RETAIN_WIFI_DAYS`) | defaults 7–90 | Log retention windows |
 
-## Dashboard sections (12)
+## Dashboard sections (13)
 
 1. Overview – stats + bandwidth / device-type charts + recent alerts
 2. Devices – inventory, labels, block/unblock, port/vuln scan, OS fingerprint
 3. Network Map – vis.js graph of gateway and devices
 4. Bandwidth – live rates, history, speed test
 5. WiFi Audit & Lab – monitor mode, survey, handshakes, event log
-6. Recon – one-click recon + deep-web + TLS check
-7. Bug Bounty – targets, enum, live-host probe, allowlisted command runner
-8. Security – alerts, MITM/rogue-DHCP, JA3, DNS threats, audit log
-9. Live Traffic / PCAP – HTTP/DNS/TLS SNI viewer, packet capture
-10. AI Brain – offline assistant + optional LLM
-11. Settings & Tools – key/value settings, external tool install
-12. Reports – security report, passive DNS, port-history
+6. Recon – classic one-click recon + deep-web + TLS check
+7. **Pro Recon** – 🚀 one-click full pipeline, live terminal + phase chips,
+   risk score, tabs (subdomains/ports/hosts/DNS/takeover/lookalikes),
+   ⏳ Time Machine snapshot diffing, attack graph, HTML report,
+   standalone intel tools (DNS dump, header grade, WHOIS, takeover, lookalikes)
+8. Bug Bounty – targets, enum, live-host probe, allowlisted command runner
+9. Security – alerts, MITM/rogue-DHCP, JA3, DNS threats, audit log
+10. Live Traffic / PCAP – HTTP/DNS/TLS SNI viewer, packet capture
+11. AI Brain – offline assistant + optional LLM
+12. Settings & Tools – key/value settings, external tool install
+13. Reports – security report, passive DNS, port-history
+
+## Pro Recon API (Batch H)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/prorecon/start` | POST | Start pipeline `{target, profile: quick\|full}` → `{job_id}` |
+| `/api/prorecon/jobs` | GET | Recent jobs |
+| `/api/prorecon/jobs/<id>` | GET | Status, phases, live log, full result |
+| `/api/recon/dns` | POST | DNS record dump `{target}` |
+| `/api/recon/whois` | POST | Keyless RDAP WHOIS `{target}` (domain or IP) |
+| `/api/recon/headers` | POST | Security-header grade `{target}` |
+| `/api/recon/takeover` | POST | Takeover scan `{target, subdomains[]?}` |
+| `/api/recon/lookalikes` | POST | Lookalike radar `{target, probe}` |
+| `/api/recon/snapshots` | GET | Attack-surface snapshots (`?target=`) |
+| `/api/recon/snapshots/<id>` | GET | One snapshot |
+| `/api/recon/snapshots/diff?a=&b=` | GET | Time-Machine diff |
+| `/api/recon/graph/<job>` | GET | vis.js attack graph nodes/edges |
+| `/api/recon/report/<job>.html` | GET | Downloadable HTML report |
+
+## Testing / CI
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python tests/smoke_test.py      # boots on :5099, logs in, runs 90+ checks
+```
+
+The smoke test exercises every API (including a full two-run Pro Recon +
+snapshot diff on a live target), the CSRF guard, input validation, and
+graceful degradation when root/scapy/WiFi are unavailable. It exits non-zero
+on any hard failure.
 
 ## Default login: `admin` / `admin123`
 
@@ -89,10 +137,12 @@ exposing this to anything outside localhost.
 ## Project layout
 
 ```
-network_manager.py   # Main Flask app (~4,900 LOC, 233 functions, 75+ routes)
+network_manager.py   # Main Flask app (~6,100 LOC, 300+ functions, 90+ routes)
 templates/
   login.html         # CSRF-protected login
-  dashboard.html     # 12-section SPA-style UI with Chart.js + vis.js + CDN fallback
+  dashboard.html     # 13-section SPA-style UI with Chart.js + vis.js + CDN fallback
+tests/
+  smoke_test.py      # End-to-end feature check (90+ assertions, boot-to-API)
 docs/
   CODE_AUDIT.md      # Security audit notes from PR #5
   HANDOFF.md         # Batch-by-batch handoff spec

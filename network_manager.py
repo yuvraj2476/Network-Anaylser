@@ -21,6 +21,10 @@ BATCHES:
      analyst (OpenAI-compatible / Ollama), settings table + masked key UI.
   G) Last fixes: CSRF guard exempts /login (proxied-previews); CDN guard
      for Chart.js / vis.js so tables still work when CDN is blocked.
+  H) Pro Recon: one-click full pipeline (DNS intel, subdomains, ports,
+     HTTP header-grading, takeover detection, lookalike-domain radar,
+     RDAP WHOIS + IP intel, risk-score engine, attack-surface snapshots
+     with DNA diffing, attack-path graph, HTML report).
 
 USE ON NETWORKS YOU OWN OR HAVE EXPLICIT WRITTEN PERMISSION TO TEST.
 Offensive features are confirm-gated + audit-logged; default credentials
@@ -578,6 +582,24 @@ def init_db():
             subdomains_json TEXT, open_ports_json TEXT, http_json TEXT, tls_json TEXT,
             vt_json TEXT, deep_web_json TEXT, summary TEXT, error TEXT
         )"""
+    )
+
+    # ----- NEW BATCH H: Pro Recon (full pipeline) + attack-surface snapshots ----
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS pro_recon_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT UNIQUE, target TEXT,
+            profile TEXT, started_at TEXT, finished_at TEXT, status TEXT, phase TEXT,
+            log_json TEXT, results_json TEXT, summary TEXT, error TEXT
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS attack_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT, taken_at TEXT,
+            dna TEXT, snapshot_json TEXT, summary TEXT DEFAULT ''
+        )"""
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attack_snapshots_target ON attack_snapshots(target)"
     )
 
     # ----- NEW BATCH F: Settings -----
@@ -2921,6 +2943,8 @@ TOOLS = [
     ("airmon-ng",   ["airmon-ng"],                    "apt-get install -y aircrack-ng"),
     ("hcxtools",    ["hcxpcapngtool", "-h"],          "apt-get install -y hcxtools"),
     ("whois",       ["whois", "--version"],           "apt-get install -y whois"),
+    ("nuclei",      ["nuclei", "-version"],           "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"),
+    ("katana",      ["katana", "-version"],           "go install -v github.com/projectdiscovery/katana/cmd/katana@latest"),
     ("dig",         ["dig", "-v"],                    "apt-get install -y dnsutils"),
     ("curl",        ["curl", "--version"],            "apt-get install -y curl"),
     ("jq",          ["jq", "--version"],              "apt-get install -y jq"),
@@ -3219,6 +3243,12 @@ def start_recon_job(target: str, modes=("subdomains","ports","http","tls","deepw
 
             # Ports for each resolved IP of root
             j["phase"] = "ports"
+            j["ports_unreliable"] = False
+            try:
+                if ips and _canary_port_check(ips[0])["canary_open"]:
+                    j["ports_unreliable"] = True
+            except Exception:
+                pass
             all_hosts = {host} | {s["subdomain"] for s in j["subdomains"]}
             # Limit to first 30 hosts for performance
             for h in list(sorted(all_hosts))[:30]:
@@ -3292,6 +3322,8 @@ def start_recon_job(target: str, modes=("subdomains","ports","http","tls","deepw
             total_ports = sum(len(v["ports"]) for v in j["open_ports"].values())
             dw_int = sum(1 for f in j["deep_web"] if f.get("interesting"))
             j["summary"] = f"subdomains={total_subs} open_ports={total_ports} deep_web_hits={len(j['deep_web'])} interesting={dw_int}"
+            if j.get("ports_unreliable"):
+                j["summary"] += " (⚠ port sweep unreliable: transparent proxy)"
             # persist to recon_log
             try:
                 conn = get_db()
@@ -3339,6 +3371,8 @@ ALLOWLISTED_BB_TOOLS = {
     "httpx": {"bin":"httpx", "allow": {"-title","-tech-detect","-status-code","-content-length","-silent","-timeout","-follow-redirects","-no-color","-ports"}},
     "ffuf": {"bin":"ffuf", "allow": {"-u","-w","-t","-maxtime","-mc","-o","-ac"}},
     "nmap": {"bin":"nmap", "allow": {"-sV","-sT","-sC","-Pn","-p","-T4","-T3","--top-ports","-oX","-oN","--open"}},
+    "nuclei": {"bin":"nuclei", "allow": {"-u","-tags","-severity","-silent","-rl","-timeout","-json","-c","-rl"}},
+    "katana": {"bin":"katana", "allow": {"-u","-silent","-d","-jsonl","-jc","-kf","-c"}},
     "dig": {"bin":"dig", "allow": {"+short","@","-t"}},
     "whois": {"bin":"whois", "allow": set()},
     "curl": {"bin":"curl", "allow": {"-s","-S","-L","-I","-m","--max-time","-A","-H"}},
@@ -3955,6 +3989,30 @@ BRAIN_KNOWLEDGE = {
         "answer": ("CSRF tokens are enforced on POST/PUT/DELETE except /login (required for first auth before the session cookie exists). "
                    "If pages are blank behind a preview proxy, check that Chart.js/vis.js CDN is reachable — tables still work if they're blocked."),
     },
+    "prorecon": {
+        "match": ["pro recon", "full recon", "one click", "one-click", "attack surface", "exposure score", "risk score"],
+        "answer": ("Pro Recon is the one-click pipeline (⚡ section): DNS intel → subdomains → port sweep → HTTP/TLS "
+                   "fingerprinting → security-header grades → subdomain-takeover checks → lookalike-domain radar → "
+                   "WHOIS/RDAP + IP intel → risk score (0-100 with fixes) → attack-surface snapshot + DNA diff. "
+                   "Pick quick or full profile, watch the live terminal, then download the HTML report."),
+    },
+    "takeover": {
+        "match": ["takeover", "dangling cname", "subdomain takeover"],
+        "answer": ("The takeover checker maps each CNAME against ~27 hosted services (GitHub Pages, Heroku, S3, Azure, "
+                   "Netlify, Vercel, Shopify…) and flags NXDOMAIN targets or 'unclaimed page' markers as VULNERABLE. "
+                   "Review entries need manual verification. Fix by re-claiming the resource or deleting the record."),
+    },
+    "lookalike": {
+        "match": ["lookalike", "typosquat", "homoglyph", "phishing domain", "bitsquat"],
+        "answer": ("The Lookalike Radar generates omissions/duplications/transpositions/homoglyphs/hyphenations/TLD-swaps "
+                   "of your domain, then resolves and HTTP-probes the live ones — defensive brand-impersonation detection."),
+    },
+    "timemachine": {
+        "match": ["time machine", "snapshot", "dna", "diff", "what changed", "change radar"],
+        "answer": ("Every Pro Recon run stores an attack-surface snapshot with a 12-char DNA fingerprint. Comparing two "
+                   "snapshots shows added/removed subdomains, new/closed ports, tech and cert changes — open the Time "
+                   "Machine tab in Pro Recon and pick two snapshots to diff."),
+    },
     "help": {
         "match": ["help", "what can you do", "commands", "features"],
         "answer": ("I can help with: scanning, blocking, parental rules, port/vuln scans, WiFi audit/handshakes, recon (subdomains + deep-web), "
@@ -3979,7 +4037,8 @@ def ask_brain(question: str, context: str = "") -> dict:
         return {
             "answer": ("I'm an offline assistant for the Network Analyzer. Ask about: "
                        "scanning, blocking, parental rules, ports, WiFi, handshakes/hashcat, "
-                       "recon, bug bounty, AI/LLM settings, DNS/threat intel, CSRF, or type 'help'."),
+                       "recon, PRO RECON (one-click pipeline, takeover, lookalikes, time machine), "
+                       "bug bounty, AI/LLM settings, DNS/threat intel, CSRF, or type 'help'."),
             "intent": "fallback", "action": None, "confidence": 0
         }
     data = BRAIN_KNOWLEDGE[best_intent]
@@ -3994,11 +4053,13 @@ def ask_brain(question: str, context: str = "") -> dict:
             "confidence": min(100, best_score * 20)}
 
 
-def llm_chat(question: str, system: str | None = None) -> tuple[bool, str]:
+def llm_chat(question: str, system: str | None = None, context: str | None = None) -> tuple[bool, str]:
     """Call an OpenAI-compatible API (works with OpenAI, Ollama in OpenAI mode, etc.)."""
     enabled = get_setting("llm_enabled", "0") == "1"
     if not enabled:
         return False, "LLM disabled. Set llm_enabled=1 in Settings."
+    if context:
+        question = f"{question}\n\n(Context from dashboard: {context[:600]})"
     base = get_setting("llm_base_url", "https://api.openai.com/v1").rstrip("/")
     model = get_setting("llm_model", "gpt-4o-mini")
     key = get_setting("llm_api_key", "")
@@ -4030,6 +4091,993 @@ def llm_chat(question: str, system: str | None = None) -> tuple[bool, str]:
         return True, content
     except Exception as e:
         return False, f"LLM call failed: {e}"
+
+
+# ============================================================
+# BATCH H: PRO RECON — one-click full pipeline
+#   * DNS intelligence (A/AAAA/MX/NS/TXT/SOA/CAA/CNAME + PTR)
+#   * subdomain takeover detection (dangling CNAME fingerprints)
+#   * HTTP security-header grading (A+..F)
+#   * lookalike/typosquat domain radar (defensive brand protection)
+#   * WHOIS via keyless RDAP + IP intel
+#   * attack-surface snapshots + DNA fingerprint + diff ("Time Machine")
+#   * risk-score engine (0..100) with prioritized remediation advice
+#   * attack-path graph (domain -> subdomain -> IP -> port -> service)
+#   * standalone HTML report export
+# All phases are read-only OSINT against targets you are authorized to test.
+# ============================================================
+pro_jobs: dict[str, dict] = {}
+pro_lock = Lock()
+
+# Fingerprint DB: CNAME suffix -> (service label, "unclaimed" page marker or None).
+# If the marker is present in the HTTP body the hosted resource is unclaimed ->
+# dangling, take-overable. None means we fall back to an NXDOMAIN check on the
+# CNAME target itself.
+TAKEOVER_CNAME: dict[str, tuple[str, str | None]] = {
+    "github.io":            ("GitHub Pages", "there isn't a github pages site here"),
+    "herokuapp.com":        ("Heroku", "no such app"),
+    "herokudns.com":        ("Heroku", None),
+    "pantheonsite.io":      ("Pantheon", "the gods are wise"),
+    "fastly.net":           ("Fastly", "fastly error: unknown domain"),
+    "azurewebsites.net":    ("Azure Web Apps", "404 web site not found"),
+    "cloudapp.net":         ("Azure CloudApp", None),
+    "azureedge.net":        ("Azure CDN", None),
+    "trafficmanager.net":   ("Azure Traffic Manager", None),
+    "blob.core.windows.net":("Azure Blob", "blobnotfound"),
+    "s3.amazonaws.com":     ("AWS S3", "nosuchbucket"),
+    "elasticbeanstalk.com": ("AWS Elastic Beanstalk", None),
+    "cloudfront.net":       ("AWS CloudFront", "bad request"),
+    "wordpress.com":        ("WordPress.com", "do you want to register"),
+    "myshopify.com":        ("Shopify", "sorry, this shop is currently unavailable"),
+    "surge.sh":             ("Surge", "project not found"),
+    "bitbucket.io":         ("Bitbucket", "repository not found"),
+    "readme.io":            ("ReadMe", "project doesnt exist"),
+    "ghost.io":             ("Ghost", "the thing you were looking for is no longer here"),
+    "zendesk.com":          ("Zendesk", "help center closed"),
+    "tumblr.com":           ("Tumblr", "there's nothing here"),
+    "cargocollective.com":  ("Cargo", "404 not found"),
+    "unbouncepages.com":    ("Unbounce", "the requested url was not found"),
+    "strikingly.com":       ("Strikingly", "but if you're looking to build your own website"),
+    "webflow.io":           ("Webflow", "the page you are looking for doesn't exist"),
+    "fly.dev":              ("Fly.io", None),
+    "netlify.app":          ("Netlify", "not found"),
+    "vercel.app":           ("Vercel", "the deployment could not be found"),
+}
+
+HOMOGLYPH = {
+    "o": ["0"], "0": ["o"], "l": ["1", "i"], "i": ["1", "l"], "1": ["l", "i"],
+    "e": ["3"], "3": ["e"], "a": ["4"], "4": ["a"], "s": ["5"], "5": ["s"],
+    "g": ["9"], "t": ["7"], "b": ["8"], "m": ["rn"], "w": ["vv"], "u": ["v"],
+}
+LOOKALIKE_TLDS = ["net", "org", "io", "co", "info", "online", "site", "xyz", "app",
+                  "dev", "me", "cc", "cloud", "shop", "store", "tech", "live", "vip", "pro", "club"]
+
+RISKY_PORTS = {
+    21: "FTP (plaintext credentials)", 23: "Telnet (plaintext)", 445: "SMB file sharing",
+    1433: "MS SQL Server", 1521: "Oracle DB", 3306: "MySQL", 3389: "RDP remote desktop",
+    5432: "PostgreSQL", 5900: "VNC remote desktop", 6379: "Redis (often unauthenticated)",
+    9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB", 2375: "Docker API (unauthenticated)",
+    5984: "CouchDB", 25: "SMTP (open-relay check)", 2323: "Telnet-alt (plaintext)",
+}
+
+SECURITY_HEADER_CHECKS = [
+    ("strict-transport-security", 25, "HSTS forces HTTPS"),
+    ("content-security-policy",   20, "CSP mitigates XSS/injection"),
+    ("x-content-type-options",    10, "stops MIME sniffing (nosniff)"),
+    ("x-frame-options",           10, "clickjacking protection"),
+    ("referrer-policy",           10, "limits referrer leakage"),
+    ("permissions-policy",        10, "restricts powerful browser features"),
+    ("x-xss-protection",           5, "legacy XSS filter hint"),
+]
+
+
+def _cname_of(host: str) -> str | None:
+    if not DNS_AVAILABLE:
+        return None
+    try:
+        for r in dns.resolver.resolve(host, "CNAME", lifetime=4):
+            return str(r.target).rstrip(".").lower()
+    except Exception:
+        pass
+    return None
+
+
+def _is_nxdomain(name: str) -> bool:
+    """True when the name demonstrably does not resolve."""
+    if DNS_AVAILABLE:
+        try:
+            dns.resolver.resolve(name, "A", lifetime=4)
+            return False
+        except dns.resolver.NXDOMAIN:
+            return True
+        except Exception:
+            return False  # SERVFAIL/timeout -> unknown, don't cry wolf
+    return not _resolve(name)
+
+
+def _quick_body(host: str, timeout: float = 5.0) -> str | None:
+    if not REQUESTS_AVAILABLE:
+        return None
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(f"{scheme}://{host}/", timeout=timeout, verify=False,
+                             allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0 Network-Analyzer"})
+            return r.text[:60000]
+        except Exception:
+            continue
+    return None
+
+
+def _canary_port_check(ip: str) -> dict:
+    """Vantage-point truth check: touch a random high port that is virtually
+    guaranteed closed. If the connect 'succeeds', a transparent egress proxy or
+    tarpit is lying to us and connect-scan results from this host are unreliable."""
+    canary = secrets.randbelow(20000) + 40000
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2.5)
+    try:
+        open_ = s.connect_ex((ip, canary)) == 0
+    except Exception:
+        open_ = False
+    finally:
+        s.close()
+    return {"canary_port": canary, "canary_open": open_, "unreliable_vantage": open_}
+
+
+def _takeover_scan(names: list[str]) -> list[dict]:
+    """Subdomain takeover check: dangling CNAMEs pointing at unclaimed hosted services."""
+    out: list[dict] = []
+
+    def check(name: str):
+        cname = _cname_of(name)
+        if not cname:
+            return None
+        for suffix, (svc, marker) in TAKEOVER_CNAME.items():
+            if cname == suffix or cname.endswith("." + suffix):
+                if marker:
+                    body = _quick_body(name) or ""
+                    if marker in body.lower():
+                        return {"subdomain": name, "cname": cname, "service": svc,
+                                "status": "vulnerable",
+                                "evidence": f"Unclaimed-page marker found: '{marker[:60]}'"}
+                    return {"subdomain": name, "cname": cname, "service": svc,
+                            "status": "review",
+                            "evidence": "Points to a take-overable service but the page looks claimed"}
+                if _is_nxdomain(cname):
+                    return {"subdomain": name, "cname": cname, "service": svc,
+                            "status": "vulnerable",
+                            "evidence": f"CNAME target {cname} is NXDOMAIN (dangling)"}
+                return {"subdomain": name, "cname": cname, "service": svc,
+                        "status": "review", "evidence": "CNAME resolves; verify the resource is still claimed"}
+        if _is_nxdomain(cname):
+            return {"subdomain": name, "cname": cname, "service": "",
+                    "status": "potential",
+                    "evidence": f"CNAME target {cname} does not resolve (dangling DNS record)"}
+        return None
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for r in ex.map(check, names):
+            if r:
+                out.append(r)
+    return sorted(out, key=lambda x: (x["status"] != "vulnerable", x["status"] != "potential", x["subdomain"]))
+
+
+def _headers_grade(host: str, timeout: float = 6.0) -> dict | None:
+    """Grade a host's HTTP security headers A+..F (securityheaders.com style)."""
+    if not REQUESTS_AVAILABLE:
+        return None
+    resp = None
+    used_scheme = None
+    for scheme in ("https", "http"):
+        try:
+            resp = requests.get(f"{scheme}://{host}/", timeout=timeout, verify=False,
+                                allow_redirects=True,
+                                headers={"User-Agent": "Mozilla/5.0 Network-Analyzer"})
+            used_scheme = scheme
+            break
+        except Exception:
+            continue
+    if resp is None:
+        return None
+    headers = {k.lower(): v for k, v in resp.headers.items()}
+    checks = []
+    score = 0
+    for key, weight, note in SECURITY_HEADER_CHECKS:
+        ok = key in headers
+        # CSP frame-ancestors substitutes X-Frame-Options
+        if key == "x-frame-options" and not ok:
+            ok = "frame-ancestors" in headers.get("content-security-policy", "").lower()
+        if ok:
+            score += weight
+        checks.append({"header": key, "ok": ok, "weight": weight, "note": note,
+                       "value": headers.get(key, "")[:160] if ok else ""})
+    issues = []
+    server = headers.get("server", "")
+    powered = headers.get("x-powered-by", "")
+    if server:
+        issues.append(f"Server header disclosure: {server[:80]}")
+    if powered:
+        score = max(0, score - 5)
+        issues.append(f"X-Powered-By disclosure: {powered[:80]}")
+    if used_scheme == "https":
+        score += 10
+    if "strict-transport-security" in headers and "max-age=0" not in headers.get("strict-transport-security", ""):
+        try:
+            ma = int(re.search(r"max-age=(\d+)", headers["strict-transport-security"]).group(1))
+            if ma >= 15552000:
+                score += 2  # long HSTS
+        except Exception:
+            pass
+    score = min(100, score)
+    if score >= 95:
+        grade = "A+"
+    elif score >= 85:
+        grade = "A"
+    elif score >= 70:
+        grade = "B"
+    elif score >= 55:
+        grade = "C"
+    elif score >= 40:
+        grade = "D"
+    else:
+        grade = "F"
+    if used_scheme != "https" and grade in ("A+", "A", "B"):
+        grade = "C"  # plaintext-only host can't grade higher than C
+    return {"host": host, "url": resp.url, "scheme": used_scheme, "grade": grade,
+            "score": score, "checks": checks, "issues": issues,
+            "server": server[:120], "powered_by": powered[:120],
+            "status": resp.status_code}
+
+
+def _dns_dump(domain: str) -> dict:
+    out = {"domain": domain, "records": {}, "ptr": {}}
+    types = ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CAA", "CNAME", "SRV", "NS"]
+    for t in dict.fromkeys(types):
+        vals = []
+        if DNS_AVAILABLE:
+            try:
+                for r in dns.resolver.resolve(domain, t, lifetime=5):
+                    vals.append(str(r).rstrip("."))
+            except Exception:
+                pass
+        elif t == "A":
+            vals = _resolve(domain)
+        if vals:
+            out["records"][t] = sorted(set(vals))
+    for ip in out["records"].get("A", [])[:5]:
+        try:
+            out["ptr"][ip] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            pass
+    return out
+
+
+def _rdap_lookup(kind: str, value: str) -> dict:
+    """Keyless WHOIS via the public rdap.org redirector. kind = 'domain' | 'ip'."""
+    if not REQUESTS_AVAILABLE:
+        return {"error": "requests library unavailable"}
+    if kind == "ip":
+        try:
+            if ipaddress.ip_address(value).is_private:
+                return {"note": "private/reserved address — no public registration"}
+        except ValueError:
+            return {"error": "invalid IP"}
+    try:
+        r = requests.get(f"https://rdap.org/{kind}/{value}", timeout=8,
+                         headers={"User-Agent": "Network-Analyzer"})
+        if not r.ok:
+            return {"error": f"rdap http {r.status_code}"}
+        d = r.json()
+        out = {"handle": d.get("handle", "") or "", "name": d.get("ldhName", "") or d.get("name", "") or ""}
+        if kind == "domain":
+            for ent in d.get("entities", []):
+                if "registrar" in (ent.get("roles") or []):
+                    try:
+                        for prop in (ent.get("vcardArray") or [None, []])[1]:
+                            if prop and prop[0] == "fn":
+                                out["registrar"] = str(prop[3])
+                    except Exception:
+                        pass
+            ev = {e.get("eventAction", ""): e.get("eventDate", "") for e in d.get("events", [])}
+            out["created"] = ev.get("registration", "") or ""
+            out["expires"] = ev.get("expiration", "") or ""
+            out["updated"] = ev.get("last changed", "") or ""
+            out["nameservers"] = [ns.get("ldhName", "") for ns in d.get("nameservers", [])][:8]
+            out["status"] = d.get("status", [])[:8]
+        else:
+            out["range"] = f"{d.get('startAddress', '')} - {d.get('endAddress', '')}"
+            out["country"] = d.get("country", "") or ""
+            out["net_type"] = d.get("type", "") or ""
+        return out
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _ip_intel(ip: str) -> dict:
+    """Read-only IP enrichment (geo/ASN) via keyless ip-api.com."""
+    try:
+        if ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback:
+            return {"ip": ip, "note": "private/reserved"}
+    except ValueError:
+        return {"ip": ip, "error": "invalid ip"}
+    if not REQUESTS_AVAILABLE:
+        return {"ip": ip, "error": "requests unavailable"}
+    try:
+        r = requests.get(
+            f"http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,as,reverse,query",
+            timeout=6)
+        if r.ok:
+            return r.json()
+        return {"ip": ip, "error": f"http {r.status_code}"}
+    except Exception as e:
+        return {"ip": ip, "error": str(e)[:160]}
+
+
+def _lookalike_variants(domain: str, max_total: int = 100) -> list[dict]:
+    """Typo/homoglyph permutations of a domain (defensive brand-protection radar)."""
+    dom = domain.lower().strip().strip(".")
+    try:
+        ipaddress.ip_address(dom)
+        return []
+    except ValueError:
+        pass
+    parts = dom.split(".")
+    if len(parts) < 2 or not parts[0]:
+        return []
+    label, tld = parts[0], parts[-1]
+    suffix = ".".join(parts[1:])
+    seen = set()
+    out = []
+
+    def add(v: str, technique: str):
+        if v and v not in seen and v != dom and "." in v:
+            seen.add(v)
+            out.append({"domain": v, "technique": technique})
+
+    for i in range(len(label)):
+        add(label[:i] + label[i + 1:] + "." + suffix, "omission")
+    for i, ch in enumerate(label):
+        if ch.isalnum():
+            add(label[:i] + ch + ch + label[i + 1:] + "." + suffix, "duplication")
+    for i in range(len(label) - 1):
+        if label[i] != label[i + 1]:
+            add(label[:i] + label[i + 1] + label[i] + label[i + 2:] + "." + suffix, "transposition")
+    for i, ch in enumerate(label):
+        for rep in HOMOGLYPH.get(ch, []):
+            add(label[:i] + rep + label[i + 1:] + "." + suffix, f"homoglyph({ch}→{rep})")
+    for i in range(1, len(label)):
+        add(label[:i] + "-" + label[i:] + "." + suffix, "hyphenation")
+    for t in LOOKALIKE_TLDS:
+        if t != tld:
+            add(label + "." + t, "tld-swap")
+    return out[:max_total]
+
+
+def _lookalike_radar(domain: str, probe: bool = True, max_total: int = 90) -> list[dict]:
+    """Resolve (and optionally HTTP-probe) lookalike domains to spot typosquat infra."""
+    variants = _lookalike_variants(domain, max_total)
+    out: list[dict] = []
+    lk = Lock()
+
+    def work(v: dict):
+        ips = _resolve(v["domain"])
+        if not ips:
+            return
+        row = {**v, "ips": ips[:4], "live": False, "title": "", "url": ""}
+        if probe and REQUESTS_AVAILABLE:
+            hp = _probe_host(v["domain"], timeout=3.0)
+            if hp:
+                row["live"] = True
+                row["title"] = hp.get("title", "")
+                row["url"] = hp.get("url", "")
+                row["status"] = hp.get("status_code")
+        with lk:
+            out.append(row)
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        list(ex.map(work, variants))
+    return sorted(out, key=lambda x: (not x["live"], x["domain"]))
+
+
+def _risk_engine(result: dict) -> dict:
+    """Aggregate every module's findings into a 0..100 exposure score + remediation list."""
+    score = 0
+    findings: list[dict] = []
+    target = result.get("target", "")
+
+    for t in result.get("takeover") or []:
+        if t["status"] == "vulnerable":
+            score += 25
+            findings.append({"severity": "high",
+                             "title": f"Subdomain takeover possible: {t['subdomain']}",
+                             "detail": f"{t['subdomain']} -> {t['cname']} ({t.get('service', 'dangling')}): {t['evidence']}",
+                             "fix": "Re-claim the hosted resource or delete the stale DNS record immediately."})
+        elif t["status"] == "potential":
+            score += 10
+            findings.append({"severity": "medium",
+                             "title": f"Dangling DNS record: {t['subdomain']}",
+                             "detail": t["evidence"],
+                             "fix": "Remove or re-point the CNAME; dangling records are takeover candidates."})
+        else:
+            score += 3
+            findings.append({"severity": "low",
+                             "title": f"Review CNAME: {t['subdomain']} -> {t['cname']}",
+                             "detail": t["evidence"],
+                             "fix": "Confirm the hosted resource is still claimed/owned."})
+
+    if result.get("ports_unreliable"):
+        score += 4
+        findings.append({"severity": "medium",
+                         "title": "Port sweep unreliable — transparent proxy/tarpit suspected",
+                         "detail": ("A random closed-canary port reported OPEN, so the egress path is "
+                                    "intercepting connections (common on filtered/cloud sandboxes). "
+                                    "Port results shown are what the vantage point *claims*, not ground truth."),
+                         "fix": "Re-run from a clean vantage point (direct server, no egress proxy) and compare DNA snapshots."})
+    else:
+        risky_hosts = 0
+        for host, info in (result.get("ports") or {}).items():
+            risky_here = sorted(p for p in info.get("ports", []) if p in RISKY_PORTS)
+            if not risky_here:
+                continue
+            risky_hosts += 1
+            sev = "high" if any(p in (23, 2323, 2375) for p in risky_here) else "medium"
+            score += min(12, 4 * len(risky_here))
+            findings.append({"severity": sev,
+                             "title": f"{len(risky_here)} risky service(s) exposed on {host}",
+                             "detail": ", ".join(f"{p} ({RISKY_PORTS[p]})" for p in risky_here[:6]),
+                             "fix": "Restrict to a management VLAN/VPN, require auth, or close unneeded ports."})
+        if risky_hosts > 4:
+            score += 6
+            findings.append({"severity": "medium",
+                             "title": f"Broad exposure: {risky_hosts} hosts with risky services",
+                             "detail": "Many sensitive services reachable increases attacker dwell surface.",
+                             "fix": "Reduce public footprint; segment internal services."})
+
+    worst_grade = None
+    for h in result.get("hosts") or []:
+        g = ((h.get("headers_grade") or {}).get("grade"))
+        if g and (worst_grade is None or _grade_rank(g) > _grade_rank(worst_grade)):
+            worst_grade = g
+    if worst_grade in ("D", "F"):
+        score += 12
+        findings.append({"severity": "medium",
+                         "title": f"Weak HTTP security headers (worst host graded {worst_grade})",
+                         "detail": "Missing HSTS/CSP/frame protections on one or more hosts.",
+                         "fix": "Add HSTS, CSP, X-Content-Type-Options, frame protection at the edge."})
+    elif worst_grade == "C":
+        score += 6
+        findings.append({"severity": "low",
+                         "title": "Bare-minimum HTTP security headers (grade C)",
+                         "detail": "Some core headers are missing.",
+                         "fix": "Raise header policy: HSTS + CSP are the big wins."})
+
+    tls = result.get("tls") or {}
+    if tls and not tls.get("error"):
+        days = tls.get("days_until_expiry")
+        if isinstance(days, int):
+            if days < 0:
+                score += 15
+                findings.append({"severity": "high", "title": "TLS certificate EXPIRED",
+                                 "detail": f"{target} cert expired {abs(days)} days ago.",
+                                 "fix": "Renew and redeploy the certificate now."})
+            elif days < 14:
+                score += 8
+                findings.append({"severity": "medium", "title": f"TLS certificate expires in {days} days",
+                                 "detail": f"Not after: {tls.get('not_after', '')}",
+                                 "fix": "Schedule renewal (ACME automation recommended)."})
+        if tls.get("is_self_signed"):
+            score += 6
+            findings.append({"severity": "medium", "title": "Self-signed TLS certificate",
+                             "detail": "Clients cannot chain trust to a public CA.",
+                             "fix": "Use a publicly trusted CA certificate."})
+        if tls.get("weak_cipher"):
+            score += 8
+            findings.append({"severity": "medium", "title": "Weak TLS cipher negotiated",
+                             "detail": f"cipher={tls.get('cipher')}",
+                             "fix": "Restrict to TLS1.2+ with AEAD ciphers."})
+
+    dw = [f for f in (result.get("deep_web") or []) if f.get("interesting")]
+    if dw:
+        score += min(18, 6 * len(dw))
+        findings.append({"severity": "high",
+                         "title": f"{len(dw)} sensitive admin/secret paths reachable",
+                         "detail": ", ".join(sorted({f['url'] for f in dw})[:5])[:220],
+                         "fix": "AuthN-gate or remove /.env, /.git, /server-status style paths from the public site."})
+
+    live_lookalikes = [l for l in result.get("lookalikes") or [] if l.get("live")]
+    if live_lookalikes:
+        score += min(12, 4 * len(live_lookalikes))
+        findings.append({"severity": "medium",
+                         "title": f"{len(live_lookalikes)} live lookalike domains detected",
+                         "detail": ", ".join(l["domain"] for l in live_lookalikes[:6]),
+                         "fix": "Monitor takedown channels; block at mail/web gateways; educate users."})
+
+    if not result.get("ports") and not result.get("hosts"):
+        findings.append({"severity": "info",
+                         "title": "No exposed services discovered from this vantage point",
+                         "detail": "Minimal external attack surface detected.",
+                         "fix": "Keep it that way — schedule recurring snapshots."})
+
+    score = min(100, score)
+    grade = "A" if score < 10 else "B" if score < 25 else "C" if score < 45 else "D" if score < 65 else "F"
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    findings.sort(key=lambda f: order.get(f["severity"], 4))
+    return {"score": score, "grade": grade, "findings": findings,
+            "checked_at": datetime.now().isoformat()}
+
+
+def _build_snapshot(result: dict) -> dict:
+    certs = {}
+    tls = result.get("tls") or {}
+    if tls and not tls.get("error") and tls.get("serial"):
+        certs[tls.get("host", result.get("target", ""))] = tls.get("serial")
+    return {
+        "subdomains": sorted(s["subdomain"] for s in (result.get("subdomains") or [])),
+        "ports": {h: sorted(info.get("ports", [])) for h, info in sorted((result.get("ports") or {}).items())},
+        "techs": {h["host"]: sorted(h.get("tech", [])) for h in (result.get("hosts") or [])},
+        "dns_a": sorted((result.get("dns") or {}).get("records", {}).get("A", [])),
+        "certs": certs,
+    }
+
+
+def _attack_dna(snapshot: dict) -> str:
+    return hashlib.sha1(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _diff_snapshots(old: dict, new: dict) -> dict:
+    d = {
+        "added_subdomains": sorted(set(new.get("subdomains", [])) - set(old.get("subdomains", []))),
+        "removed_subdomains": sorted(set(old.get("subdomains", [])) - set(new.get("subdomains", []))),
+        "new_ports": {}, "closed_ports": {}, "tech_changes": {},
+        "dns_changed": old.get("dns_a") != new.get("dns_a"),
+        "cert_changed": old.get("certs") != new.get("certs"),
+    }
+    for h in set(old.get("ports", {})) | set(new.get("ports", {})):
+        op = set(old.get("ports", {}).get(h, []))
+        np = set(new.get("ports", {}).get(h, []))
+        if np - op:
+            d["new_ports"][h] = sorted(np - op)
+        if op - np:
+            d["closed_ports"][h] = sorted(op - np)
+    for h in set(old.get("techs", {})) | set(new.get("techs", {})):
+        ot, nt = old.get("techs", {}).get(h, []), new.get("techs", {}).get(h, [])
+        if ot != nt:
+            d["tech_changes"][h] = {"before": ot, "after": nt}
+    d["changed"] = bool(d["added_subdomains"] or d["removed_subdomains"] or d["new_ports"]
+                        or d["closed_ports"] or d["tech_changes"] or d["dns_changed"] or d["cert_changed"])
+    return d
+
+
+def _snapshot_store(target: str, snapshot: dict, summary: str = "") -> tuple[int, str]:
+    dna = _attack_dna(snapshot)
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO attack_snapshots (target, taken_at, dna, snapshot_json, summary) VALUES (?,?,?,?,?)",
+        (target, datetime.now().isoformat(), dna, json.dumps(snapshot), summary))
+    sid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return sid, dna
+
+
+def _snapshot_latest(target: str) -> dict | None:
+    conn = get_db()
+    r = conn.execute(
+        "SELECT id, taken_at, dna, snapshot_json, summary FROM attack_snapshots WHERE target=? ORDER BY id DESC LIMIT 1",
+        (target,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    try:
+        snap = json.loads(r["snapshot_json"] or "{}")
+    except Exception:
+        snap = {}
+    return {"id": r["id"], "taken_at": r["taken_at"], "dna": r["dna"], "snapshot": snap, "summary": r["summary"]}
+
+
+def _snapshot_list(target: str | None = None, limit: int = 40) -> list[dict]:
+    conn = get_db()
+    if target:
+        rows = conn.execute(
+            "SELECT id, target, taken_at, dna, summary FROM attack_snapshots WHERE target=? ORDER BY id DESC LIMIT ?",
+            (target, limit)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, target, taken_at, dna, summary FROM attack_snapshots ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _snapshot_get(sid: int) -> dict | None:
+    conn = get_db()
+    r = conn.execute("SELECT * FROM attack_snapshots WHERE id=?", (sid,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    out = dict(r)
+    try:
+        out["snapshot"] = json.loads(out.pop("snapshot_json") or "{}")
+    except Exception:
+        out["snapshot"] = {}
+    return out
+
+
+def _attack_graph(result: dict) -> dict:
+    """Build a vis.js-ready node/edge graph: domain -> subdomains -> IPs -> ports."""
+    nodes, edges = [], []
+    seen_nodes = set()
+
+    def add_node(nid, label, group, title=""):
+        if nid in seen_nodes or len(nodes) >= 260:
+            return
+        seen_nodes.add(nid)
+        nodes.append({"id": nid, "label": label[:48], "group": group, "title": title[:200]})
+
+    target = result.get("target", "target")
+    add_node("root", target, "root", "Root domain")
+    for s in (result.get("subdomains") or [])[:80]:
+        sub = s["subdomain"]
+        add_node(f"sub::{sub}", sub, "subdomain", ",".join(s.get("sources", [])))
+        edges.append({"from": "root", "to": f"sub::{sub}"})
+    for h, info in (result.get("ports") or {}).items():
+        ip = info.get("ip", "")
+        add_node(f"sub::{h}", h, "subdomain")
+        if ip:
+            add_node(f"ip::{ip}", ip, "ip", h)
+            edges.append({"from": f"sub::{h}", "to": f"ip::{ip}"})
+        for p in info.get("ports", [])[:12]:
+            pid = f"port::{ip}:{p}"
+            svc = RISKY_PORTS.get(p, "")
+            add_node(pid, f":{p}", "risky_port" if p in RISKY_PORTS else "port", f"{ip}:{p} {svc}")
+            edges.append({"from": f"ip::{ip}" if ip else f"sub::{h}", "to": pid, "label": svc[:24]})
+    for tk in (result.get("takeover") or []):
+        if tk["status"] == "vulnerable":
+            add_node(f"takeover::{tk['subdomain']}", "⚠ TAKEOVER", "takeover",
+                     f"{tk['subdomain']} -> {tk['cname']} ({tk.get('service', '')})")
+            edges.append({"from": f"sub::{tk['subdomain']}", "to": f"takeover::{tk['subdomain']}"})
+    return {"nodes": nodes, "edges": edges}
+
+
+def start_pro_recon(target: str, profile: str = "quick") -> str:
+    """One-click full pipeline. Profile 'quick' = core surface map; 'full' adds
+    lookalikes, WHOIS/IP intel and the deep-web admin-page sweep."""
+    profile = "full" if profile == "full" else "quick"
+    job_id = f"pro_{secrets.token_hex(6)}"
+    phases = (["dns", "subdomains", "ports", "http", "headers", "takeover"]
+              + (["lookalikes", "whois", "deepweb"] if profile == "full" else [])
+              + ["risk", "snapshot"])
+    with pro_lock:
+        pro_jobs[job_id] = {
+            "job_id": job_id, "target": target, "profile": profile,
+            "status": "queuing", "phase": "boot",
+            "phases": {p: "pending" for p in phases},
+            "log": [], "started_at": datetime.now().isoformat(), "finished_at": None,
+            "result": {"target": _safe_host(target), "subdomains": [], "ports": {}, "hosts": [],
+                       "takeover": [], "lookalikes": [], "whois": {}, "dns": {}, "tls": {},
+                       "deep_web": [], "risk": {}, "diff": {}, "graph": {}, "dna": ""},
+            "summary": "", "error": "",
+        }
+
+    def run():
+        j = pro_jobs[job_id]
+        r = j["result"]
+
+        def log(msg: str):
+            line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+            with pro_lock:
+                j["log"].append(line)
+                if len(j["log"]) > 400:
+                    j["log"][:] = j["log"][-400:]
+
+        def setph(name: str, state: str):
+            with pro_lock:
+                j["phases"][name] = state
+                j["phase"] = name
+
+        def save(status: str):
+            j["status"] = status
+            j["finished_at"] = datetime.now().isoformat()
+            try:
+                conn = get_db()
+                conn.execute(
+                    """INSERT OR REPLACE INTO pro_recon_log
+                       (job_id,target,profile,started_at,finished_at,status,phase,log_json,results_json,summary,error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (job_id, j["target"], profile, j["started_at"], j["finished_at"], status,
+                     j["phase"], json.dumps(j["log"][-120:]), json.dumps(r)[:900000],
+                     j["summary"], j["error"]))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"[!] pro recon persist error: {e}")
+
+        j["status"] = "running"
+        host = _safe_host(target)
+        try:
+            log(f"▶ PRO RECON started on {host} (profile={profile})")
+            if get_setting("confirm_attack", "1") == "1":
+                log("authorization assumed — you confirmed this target is in-scope")
+            if not host:
+                raise RuntimeError("empty/invalid target")
+
+            # ---- DNS intelligence ----
+            setph("dns", "running")
+            r["dns"] = _dns_dump(host)
+            rec = r["dns"]["records"]
+            ips = rec.get("A") or _resolve(host)
+            log(f"dns: {list(rec.keys()) or 'no records'} A={ips[:5] if ips else '—'}")
+            if not ips:
+                raise RuntimeError("target does not resolve (check spelling / network)")
+            setph("dns", "done")
+
+            # ---- Subdomains ----
+            setph("subdomains", "running")
+            subs = _enumerate_subdomains(host)
+            r["subdomains"] = subs
+            log(f"subs: {len(subs)} unique hosts ({', '.join(s['subdomain'] for s in subs[:6])}…)")
+            setph("subdomains", "done")
+
+            # ---- Ports ----
+            setph("ports", "running")
+            r["ports_unreliable"] = False
+            try:
+                if ips:
+                    check = _canary_port_check(ips[0])
+                    if check["canary_open"]:
+                        r["ports_unreliable"] = True
+                        log(f"ports: ⚠ canary port {check['canary_port']} reported OPEN on {ips[0]} — "
+                            "transparent proxy/tarpit on this vantage point; sweep results are untrustworthy")
+            except Exception:
+                pass
+            all_hosts = sorted({host} | {s["subdomain"] for s in subs})[:40]
+            port_total = 0
+            for h in all_hosts:
+                for ip in _resolve(h)[:2]:
+                    try:
+                        op = _resolve_open_ports(ip)
+                        if op:
+                            r["ports"][h] = {"ip": ip, "ports": op}
+                            port_total += len(op)
+                            break
+                    except Exception:
+                        pass
+            log(f"ports: swept {len(all_hosts)} hosts — {port_total} open ports on {len(r['ports'])} hosts")
+            setph("ports", "done")
+
+            # ---- HTTP fingerprinting (+ TLS on root) ----
+            setph("http", "running")
+            probe_hosts = sorted({host} | set(r["ports"].keys()))[:40]
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                for hp in ex.map(lambda h: _probe_host(h, timeout=5.0), probe_hosts):
+                    if hp:
+                        r["hosts"].append(hp)
+            r["tls"] = grab_tls_cert(host, 443, timeout=4) or {}
+            techs = {t for h in r["hosts"] for t in h.get("tech", [])}
+            log(f"http: {len(r['hosts'])} live hosts; tech: {', '.join(sorted(techs)) or 'none detected'}")
+            setph("http", "done")
+
+            # ---- Header hygiene grades ----
+            setph("headers", "running")
+            graded = 0
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                for hg in ex.map(lambda h: _headers_grade(h["host"]), r["hosts"][:25]):
+                    if hg:
+                        graded += 1
+                        for h in r["hosts"]:
+                            if h["host"] == hg["host"] and "headers_grade" not in h:
+                                h["headers_grade"] = {k: hg[k] for k in ("grade", "score", "issues", "scheme")}
+            log(f"headers: graded {graded} hosts — worst: "
+                f"{_risk_engine_preview_grade(r['hosts']) if graded else 'n/a'}")
+            setph("headers", "done")
+
+            # ---- Subdomain takeover ----
+            setph("takeover", "running")
+            r["takeover"] = _takeover_scan([s["subdomain"] for s in subs][:80])
+            vulns = sum(1 for t in r["takeover"] if t["status"] == "vulnerable")
+            log(f"takeover: {len(r['takeover'])} dangling candidates ({vulns} VULNERABLE)")
+            setph("takeover", "done")
+
+            if profile == "full":
+                # ---- Lookalike radar ----
+                setph("lookalikes", "running")
+                r["lookalikes"] = _lookalike_radar(host, probe=True, max_total=90)
+                live = sum(1 for l in r["lookalikes"] if l.get("live"))
+                log(f"lookalikes: {len(r['lookalikes'])} resolving permutations ({live} serving content)")
+                setph("lookalikes", "done")
+
+                # ---- WHOIS / IP intel ----
+                setph("whois", "running")
+                who = {"domain": {}, "ips": {}, "ip_intel": {}}
+                def _rd(d): who["domain"] = _rdap_lookup("domain", host)
+                def _ri(ip): who["ips"][ip] = _rdap_lookup("ip", ip)
+                def _ii(ip): who["ip_intel"][ip] = _ip_intel(ip)
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futs = [ex.submit(_rd, host)]
+                    for ip in ips[:3]:
+                        futs.append(ex.submit(_ri, ip))
+                        futs.append(ex.submit(_ii, ip))
+                    for f in futs:
+                        f.result()
+                r["whois"] = who
+                log(f"whois: registrar={who['domain'].get('registrar', 'n/a') or 'n/a'} "
+                    f"exp={who['domain'].get('expires', 'n/a') or 'n/a'}")
+                setph("whois", "done")
+
+                # ---- Deep web sweep ----
+                setph("deepweb", "running")
+                r["deep_web"] = _deep_web_scan(host, concurrency=20, max_paths=250)
+                interesting = sum(1 for f in r["deep_web"] if f.get("interesting"))
+                log(f"deepweb: {len(r['deep_web'])} paths responded ({interesting} INTERESTING)")
+                setph("deepweb", "done")
+
+            # ---- Risk score ----
+            setph("risk", "running")
+            r["risk"] = _risk_engine(r)
+            log(f"risk: {r['risk']['score']}/100 grade {r['risk']['grade']} "
+                f"({len(r['risk']['findings'])} findings)")
+            setph("risk", "done")
+
+            # ---- Snapshot + diff (Time Machine) ----
+            setph("snapshot", "running")
+            snap = _build_snapshot(r)
+            prev = _snapshot_latest(host)
+            summary = (f"risk {r['risk']['score']}({r['risk']['grade']}) subs={len(subs)} "
+                       f"ports={port_total} hosts={len(r['hosts'])} takeover={vulns if profile else len(r['takeover'])}")
+            sid, dna = _snapshot_store(host, snap, summary)
+            r["dna"] = dna
+            r["snapshot_id"] = sid
+            if prev is None:
+                r["diff"] = {"first_snapshot": True, "changed": False}
+                log(f"snapshot: first baseline stored (dna={dna})")
+            else:
+                diff = _diff_snapshots(prev["snapshot"], snap)
+                r["diff"] = diff
+                if diff["changed"]:
+                    chg = (f"+{len(diff['added_subdomains'])} subs, -{len(diff['removed_subdomains'])} subs, "
+                           f"+{sum(len(v) for v in diff['new_ports'].values())} ports, "
+                           f"-{sum(len(v) for v in diff['closed_ports'].values())} ports")
+                    log(f"snapshot: ATTACK SURFACE CHANGED ({chg}) dna {prev['dna']}→{dna}")
+                    generate_alert("attack_surface_changed", f"Attack surface changed for {host}: {chg}")
+                else:
+                    log(f"snapshot: surface unchanged since {prev['taken_at'][:16]} (dna={dna})")
+            setph("snapshot", "done")
+
+            # ---- Graph ----
+            r["graph"] = _attack_graph(r)
+
+            j["summary"] = summary + f" dna={dna}"
+            log(f"✔ PRO RECON complete — {j['summary']}")
+            save("done")
+            audit("pro_recon_complete", details=f"{host} [{profile}] {j['summary']}")
+        except Exception as e:
+            j["error"] = str(e)[:300]
+            log(f"✖ FAILED: {j['error']}")
+            for p, st in j["phases"].items():
+                if st == "running":
+                    j["phases"][p] = "error"
+            save("failed")
+            audit("pro_recon_failed", details=f"{host}: {j['error']}", success=0)
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def _grade_rank(g: str) -> int:
+    return {"A+": 0, "A": 1, "B": 2, "C": 3, "D": 4, "F": 5}.get(g, 3)
+
+
+def _risk_engine_preview_grade(hosts: list[dict]) -> str:
+    worst = None
+    for h in hosts:
+        g = ((h.get("headers_grade") or {}).get("grade"))
+        if g and (worst is None or _grade_rank(g) > _grade_rank(worst)):
+            worst = g
+    return worst or "n/a"
+
+
+def get_pro_job(job_id: str) -> dict | None:
+    with pro_lock:
+        j = pro_jobs.get(job_id)
+        if j:
+            return dict(j, log=list(j["log"]))
+    conn = get_db()
+    r = conn.execute("SELECT * FROM pro_recon_log WHERE job_id=?", (job_id,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    out = dict(r)
+    try:
+        out["result"] = json.loads(out.pop("results_json") or "{}")
+    except Exception:
+        out["result"] = {}
+    try:
+        out["log"] = json.loads(out.pop("log_json") or "[]")
+    except Exception:
+        out["log"] = []
+    out["phases"] = {}
+    return out
+
+
+def list_pro_jobs(limit: int = 30) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT job_id,target,profile,started_at,finished_at,status,phase,summary,error "
+        "FROM pro_recon_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    out = [dict(r) for r in rows]
+    seen = {r["job_id"] for r in out}
+    with pro_lock:
+        for jid, j in pro_jobs.items():
+            if jid not in seen:
+                out.insert(0, {"job_id": jid, "target": j["target"], "profile": j["profile"],
+                               "started_at": j["started_at"], "finished_at": j["finished_at"],
+                               "status": j["status"], "phase": j["phase"],
+                               "summary": j["summary"], "error": j["error"]})
+    return out
+
+
+def _render_recon_report(job: dict) -> str:
+    """Standalone HTML report for a Pro Recon job."""
+    esc = html.escape
+    r = job.get("result") or {}
+    risk = r.get("risk") or {}
+    grade = risk.get("grade", "?")
+
+    def table(headers, rows):
+        t = "<table><thead><tr>" + "".join(f"<th>{esc(str(h))}</th>" for h in headers) + "</tr></thead><tbody>"
+        for row in rows:
+            t += "<tr>" + "".join(f"<td>{esc(str(c))}</td>" for c in row) + "</tr>"
+        return t + "</tbody></table>"
+
+    findings_rows = [[f.get("severity", ""), f.get("title", ""), f.get("detail", ""), f.get("fix", "")]
+                     for f in risk.get("findings", [])]
+    subs_rows = [[s.get("subdomain", ""), ", ".join(s.get("sources", []))] for s in r.get("subdomains", [])]
+    ports_rows = [[h, i.get("ip", ""), ", ".join(map(str, i.get("ports", [])))] for h, i in (r.get("ports") or {}).items()]
+    hosts_rows = [[h.get("url", "") or h.get("host", ""), h.get("status_code", ""), h.get("title", ""),
+                   ", ".join(h.get("tech", [])), (h.get("headers_grade") or {}).get("grade", "")]
+                  for h in r.get("hosts", [])]
+    takeover_rows = [[t.get("subdomain", ""), t.get("cname", ""), t.get("service", ""),
+                      t.get("status", ""), t.get("evidence", "")] for t in r.get("takeover", [])]
+    look_rows = [[l.get("domain", ""), l.get("technique", ""), ", ".join(l.get("ips", [])),
+                  "live" if l.get("live") else "resolves", l.get("title", "")] for l in r.get("lookalikes", [])]
+    dns_rows = [[k, "; ".join(v[:20])] for k, v in (r.get("dns") or {}).get("records", {}).items()]
+    dw_rows = [[f.get("url", ""), f.get("status", ""), f.get("length", ""),
+                "★" if f.get("interesting") else ""] for f in r.get("deep_web", [])]
+    body = f"""<!doctype html><html><head><meta charset="utf-8"><title>Recon Report — {esc(job.get('target',''))}</title>
+<style>
+body{{font-family:system-ui,Segoe UI,sans-serif;background:#0b111a;color:#e2e8f0;padding:32px;max-width:1100px;margin:auto}}
+h1{{font-size:26px}} h2{{font-size:18px;margin-top:32px;border-bottom:1px solid #223;padding-bottom:6px}}
+.kv{{display:grid;grid-template-columns:220px 1fr;gap:4px 14px;font-size:13px;margin:12px 0}}
+.kv .k{{color:#64748b}}
+table{{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}}
+th,td{{border:1px solid #223;padding:5px 8px;text-align:left;vertical-align:top}}
+th{{background:#131c2b;color:#94a3b8}}
+.grade{{display:inline-block;font-size:40px;font-weight:800;padding:10px 22px;border:3px solid currentColor;border-radius:12px}}
+.sev-high{{color:#ff4757;font-weight:700}} .bad{{color:#ff4757}} .good{{color:#00ff88}}
+.small{{color:#64748b;font-size:11px}}
+</style></head><body>
+<h1>Recon Report — {esc(job.get("target", ""))}</h1>
+<div class="small">Generated {esc(datetime.now().isoformat(timespec='seconds'))} • job {esc(job.get("job_id",""))} • profile {esc(job.get("profile",""))} • for authorized testing only</div>
+<div class="kv">
+<div class="k">Status</div><div>{esc(job.get("status",""))} ({esc(job.get("started_at",""))[:19]} &rarr; {esc(job.get("finished_at","") or "")[:19]})</div>
+<div class="k">Attack-surface DNA</div><div><code>{esc(r.get("dna",""))}</code> {"(changed since last snapshot!)" if (r.get("diff") or {}).get("changed") else ""}</div>
+<div class="k">Summary</div><div>{esc(job.get("summary",""))}</div>
+</div>
+<h2>Risk score</h2>
+<div><span class="grade {'bad' if grade in ('D','F') else 'good'}">{esc(grade)}</span>
+<span style="font-size:22px;margin-left:14px">{esc(str(risk.get("score","?")))}/100</span></div>
+{table(["Severity","Finding","Detail","Recommended fix"], findings_rows) if findings_rows else "<p>No findings.</p>"}
+<h2>DNS records</h2>{table(["Type","Values"], dns_rows) if dns_rows else "<p>—</p>"}
+<h2>Subdomains ({len(subs_rows)})</h2>{table(["Name","Sources"], subs_rows) if subs_rows else "<p>—</p>"}
+<h2>Open ports</h2>{table(["Host","IP","Open ports"], ports_rows) if ports_rows else "<p>—</p>"}
+<h2>HTTP hosts</h2>{table(["URL","Status","Title","Tech","Header grade"], hosts_rows) if hosts_rows else "<p>—</p>"}
+<h2>Subdomain takeover</h2>{table(["Subdomain","CNAME","Service","Status","Evidence"], takeover_rows) if takeover_rows else "<p>None found.</p>"}
+<h2>Lookalike domains</h2>{table(["Domain","Technique","IPs","State","Title"], look_rows) if look_rows else "<p>Not run (quick profile or none resolving).</p>"}
+<h2>Deep-web hits</h2>{table(["URL","Status","Length","Interesting"], dw_rows) if dw_rows else "<p>Not run (quick profile) or nothing found.</p>"}
+</body></html>"""
+    return body
 
 
 # ============================================================
@@ -4098,6 +5146,12 @@ def api_stats():
     # bb summary
     bb_targets_count = conn.execute("SELECT COUNT(*) FROM bb_targets WHERE active=1").fetchone()[0]
     bb_hosts = conn.execute("SELECT COUNT(*) FROM bb_live_hosts").fetchone()[0]
+    # pro recon summary
+    try:
+        snap_count = conn.execute("SELECT COUNT(*) FROM attack_snapshots").fetchone()[0]
+        pro_count = conn.execute("SELECT COUNT(*) FROM pro_recon_log").fetchone()[0]
+    except Exception:
+        snap_count = pro_count = 0
     conn.close()
     return jsonify({
         "total_devices": total, "online_devices": online, "blocked_devices": blocked,
@@ -4109,6 +5163,7 @@ def api_stats():
                  "monitor_active": wifi_state.get("monitor_active", False),
                  "monitor_iface": wifi_state.get("monitor_interface")},
         "bugbounty": {"targets": bb_targets_count, "live_hosts": bb_hosts},
+        "prorecon": {"jobs": pro_count, "snapshots": snap_count},
         "scapy_available": SCAPY_AVAILABLE, "scapy_error": SCAPY_IMPORT_ERROR,
         "ai": {"llm_enabled": get_setting("llm_enabled","0")=="1"},
     })
@@ -4669,6 +5724,9 @@ def api_recon_start():
     d=get_json_body(); tgt=str(d.get("target","")).strip()
     if not tgt: return jsonify({"success":False,"error":"target required"}),400
     modes = tuple(d.get("modes") or ("subdomains","ports","http","tls","deepweb"))
+    # "http" implies the TLS phase too (UI labels it "http/tls")
+    if "http" in modes and "tls" not in modes:
+        modes = tuple(list(modes) + ["tls"])
     if d.get("vt"): modes = tuple(list(modes) + ["vt"])
     job_id = start_recon_job(tgt, modes=modes)
     return jsonify({"success":True,"job_id":job_id})
@@ -4701,6 +5759,171 @@ def api_recon_deepweb(job_id):
     j = get_recon_job(job_id)
     if not j: return jsonify({"success":False,"error":"not found"}),404
     return jsonify({"success":True,"results":j.get("deep_web",[])})
+
+
+# ----- BATCH H: Pro Recon (one-click full pipeline + intel modules) -----
+@app.route("/api/prorecon/start", methods=["POST"])
+@login_required
+def api_pro_start():
+    if not REQUESTS_AVAILABLE:
+        return jsonify({"success":False,"error":"requests library unavailable"}),503
+    d = get_json_body()
+    tgt = str(d.get("target","")).strip()
+    if not tgt:
+        return jsonify({"success":False,"error":"target required"}),400
+    host = _safe_host(tgt)
+    if not host or len(host) > 253 or ".." in host:
+        return jsonify({"success":False,"error":"bad target"}),400
+    profile = str(d.get("profile","quick"))
+    job_id = start_pro_recon(host, profile)
+    audit("pro_recon_start", details=f"{host} profile={profile}")
+    return jsonify({"success":True,"job_id":job_id})
+
+
+@app.route("/api/prorecon/jobs")
+@login_required
+def api_pro_jobs():
+    return jsonify(list_pro_jobs(40))
+
+
+@app.route("/api/prorecon/jobs/<job_id>")
+@login_required
+def api_pro_job(job_id):
+    j = get_pro_job(job_id)
+    if not j:
+        return jsonify({"success":False,"error":"not found"}),404
+    return jsonify({"success":True,"job":j})
+
+
+@app.route("/api/recon/dns", methods=["POST"])
+@login_required
+def api_recon_dns():
+    d = get_json_body()
+    host = _safe_host(str(d.get("target","") or d.get("domain","")))
+    if not host:
+        return jsonify({"success":False,"error":"target required"}),400
+    audit("dns_dump", details=host)
+    return jsonify({"success":True,"result":_dns_dump(host)})
+
+
+@app.route("/api/recon/whois", methods=["POST"])
+@login_required
+def api_recon_whois():
+    d = get_json_body()
+    q = str(d.get("target","")).strip()
+    if not q:
+        return jsonify({"success":False,"error":"target required"}),400
+    try:
+        ipaddress.ip_address(q)
+        kind = "ip"
+    except ValueError:
+        kind = "domain"
+        q = _safe_host(q)
+    audit("whois_lookup", details=f"{kind}:{q}")
+    return jsonify({"success":True,"kind":kind,"target":q,"result":_rdap_lookup(kind, q)})
+
+
+@app.route("/api/recon/headers", methods=["POST"])
+@login_required
+def api_recon_headers():
+    d = get_json_body()
+    host = _safe_host(str(d.get("target","") or d.get("host","")))
+    if not host:
+        return jsonify({"success":False,"error":"target required"}),400
+    g = _headers_grade(host)
+    if g is None:
+        return jsonify({"success":False,"error":"host not reachable over http/https"}),502
+    audit("headers_grade", details=f"{host} grade={g['grade']}")
+    return jsonify({"success":True,"result":g})
+
+
+@app.route("/api/recon/takeover", methods=["POST"])
+@login_required
+def api_recon_takeover():
+    d = get_json_body()
+    host = _safe_host(str(d.get("target","")))
+    if not host:
+        return jsonify({"success":False,"error":"target required"}),400
+    names = {host}
+    for s in bb_list_subdomains(host, 200):
+        names.add(s["subdomain"])
+    for s in d.get("subdomains") or []:
+        s2 = _safe_host(str(s))
+        if s2:
+            names.add(s2)
+    res = _takeover_scan(sorted(names)[:150])
+    audit("takeover_scan", details=f"{host} names={len(names)} hits={len(res)}")
+    return jsonify({"success":True,"results":res,"checked":len(names)})
+
+
+@app.route("/api/recon/lookalikes", methods=["POST"])
+@login_required
+def api_recon_lookalikes():
+    d = get_json_body()
+    host = _safe_host(str(d.get("target","")))
+    if not host:
+        return jsonify({"success":False,"error":"target required"}),400
+    probe = bool(d.get("probe", True))
+    res = _lookalike_radar(host, probe=probe)
+    audit("lookalike_radar", details=f"{host} hits={len(res)}")
+    return jsonify({"success":True,"results":res,"permutations_checked":len(_lookalike_variants(host))})
+
+
+@app.route("/api/recon/snapshots")
+@login_required
+def api_snapshots():
+    target = _safe_host(request.args.get("target","")) or None
+    return jsonify(_snapshot_list(target, 40))
+
+
+@app.route("/api/recon/snapshots/<int:sid>")
+@login_required
+def api_snapshot_get(sid):
+    s = _snapshot_get(sid)
+    if not s:
+        return jsonify({"success":False,"error":"not found"}),404
+    return jsonify({"success":True,"snapshot":s})
+
+
+@app.route("/api/recon/snapshots/diff")
+@login_required
+def api_snapshot_diff():
+    a = request.args.get("a", type=int)
+    b = request.args.get("b", type=int)
+    if not a or not b:
+        return jsonify({"success":False,"error":"a and b snapshot ids required"}),400
+    sa, sb = _snapshot_get(a), _snapshot_get(b)
+    if not sa or not sb:
+        return jsonify({"success":False,"error":"snapshot not found"}),404
+    # oldest first
+    if sa["id"] > sb["id"]:
+        sa, sb = sb, sa
+    diff = _diff_snapshots(sa["snapshot"], sb["snapshot"])
+    return jsonify({"success":True,"a":{"id":sa["id"],"taken_at":sa["taken_at"],"dna":sa["dna"]},
+                    "b":{"id":sb["id"],"taken_at":sb["taken_at"],"dna":sb["dna"]},"diff":diff})
+
+
+@app.route("/api/recon/graph/<job_id>")
+@login_required
+def api_recon_graph(job_id):
+    j = get_pro_job(job_id)
+    if not j:
+        return jsonify({"success":False,"error":"not found"}),404
+    graph = (j.get("result") or {}).get("graph") or {}
+    if not graph and j.get("result"):
+        graph = _attack_graph(j["result"])
+    return jsonify({"success":True,"graph":graph})
+
+
+@app.route("/api/recon/report/<job_id>.html")
+@login_required
+def api_recon_report(job_id):
+    j = get_pro_job(job_id)
+    if not j:
+        return jsonify({"success":False,"error":"not found"}),404
+    audit("recon_report_download", details=f"{j.get('target')} job={job_id}")
+    return Response(_render_recon_report(j), mimetype="text/html",
+                    headers={"Content-Disposition": f"attachment; filename=recon_{_safe_host(j.get('target','report'))}.html"})
 
 
 # ----- TLS -----

@@ -99,6 +99,12 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 .pill{padding:1px 7px;border-radius:8px;font-size:10px;background:var(--card2);color:var(--dim);margin-right:4px;}
 .ai-box{display:flex;flex-direction:column;gap:10px;} .ai-chat{background:var(--card2);border-radius:8px;padding:12px;height:300px;overflow-y:auto;font-size:12px;display:flex;flex-direction:column;gap:8px;} .ai-msg{padding:8px 10px;border-radius:8px;max-width:85%;} .ai-msg.me{align-self:flex-end;background:rgba(0,212,255,.12);} .ai-msg.bot{align-self:flex-start;background:rgba(0,255,136,.08);} .ai-msg small{color:var(--dim);display:block;margin-top:4px;font-size:10px;}
 .mono{font-family:ui-monospace,Consolas,monospace;font-size:11px;word-break:break-all;}
+.phase-chip{padding:4px 10px;border-radius:12px;font-size:10px;font-weight:700;background:var(--card2);color:var(--dim);border:1px solid var(--border);letter-spacing:.4px;}
+.phase-chip.running{background:rgba(0,212,255,.18);color:var(--accent);border-color:var(--accent);animation:pulse 1.2s infinite;}
+.phase-chip.done{background:rgba(0,255,136,.14);color:var(--accent2);}
+.phase-chip.error{background:rgba(255,71,87,.22);color:var(--red);}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.risk-big{font-size:44px;font-weight:800;}
 @media (max-width:900px){.sidebar{transform:translateX(-100%);} .main{margin-left:0;} .grid-2{grid-template-columns:1fr;}}
 </style>
 </head>
@@ -115,6 +121,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   <button class="nav-item" data-go="sec-bandwidth"><span class="icon">📶</span>Bandwidth</button>
   <button class="nav-item" data-go="sec-wifi-audit"><span class="icon">📡</span>WiFi Audit &amp; Lab</button>
   <button class="nav-item" data-go="sec-recon"><span class="icon">🔍</span>Recon</button>
+  <button class="nav-item" data-go="sec-prorecon"><span class="icon">⚡</span>Pro Recon</button>
   <button class="nav-item" data-go="sec-bugbounty"><span class="icon">🎯</span>Bug Bounty</button>
   <button class="nav-item" data-go="sec-security"><span class="icon">🛡️</span>Security &amp; Alerts</button>
   <button class="nav-item" data-go="sec-live-traffic"><span class="icon">👁️</span>Live Traffic / PCAP</button>
@@ -248,6 +255,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
       <label><input type="checkbox" id="recon-deepweb" checked> deep-web scan</label>
       <label><input type="checkbox" id="recon-vt"> VirusTotal (needs key)</label>
       <button class="btn btn-primary" onclick="startRecon()">▶ Start recon</button>
+      <button class="btn btn-success" onclick="document.getElementById('pro-target').value=document.getElementById('recon-target').value; go('sec-prorecon');">⚡ Open Pro Recon →</button>
     </div>
     <div id="recon-status" class="mono" style="margin-top:8px;">Idle.</div>
     <div class="progress" style="display:none" id="recon-progress"><div style="width:0%"></div></div>
@@ -257,6 +265,89 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   <div class="panel"><h3>TLS check (single host)</h3>
     <div class="input-row"><input id="tls-host" placeholder="host:port" size="30"><button class="btn" onclick="checkTls()">Check</button></div>
     <div id="tls-out" class="mono"></div>
+  </div>
+</section>
+
+<!-- ============= PRO RECON ============= -->
+<section class="section" id="sec-prorecon">
+  <div class="page-header"><div><h2>⚡ Pro Recon — One-Click Attack-Surface Automation</h2>
+    <div class="sub">DNS intel → subdomains → ports → HTTP/TLS → header grades → takeover → lookalikes → WHOIS → risk score → snapshot &amp; diff</div></div></div>
+  <div class="legal">⚠️ Authorized targets only. The <b>full</b> profile adds lookalike radar, WHOIS/IP intel and a ~370-path deep-web sweep (hundreds of requests to the target).</div>
+
+  <div class="panel">
+    <h3>🚀 One-click pipeline</h3>
+    <div class="input-row">
+      <input id="pro-target" placeholder="target (e.g. example.com)" size="34">
+      <select id="pro-profile"><option value="quick">Quick — surface map</option><option value="full">Full — everything</option></select>
+      <button class="btn btn-primary" style="font-size:14px;padding:10px 18px" onclick="startProRecon()">🚀 ONE-CLICK FULL RECON</button>
+      <a class="btn btn-outline" id="pro-report-btn" style="display:none" target="_blank" href="#">⬇ HTML report</a>
+    </div>
+    <div id="pro-phases" class="input-row"></div>
+    <div id="pro-summaryline" class="mono" style="margin-bottom:6px"></div>
+    <div class="log-terminal" id="pro-log" style="height:220px">Idle — enter a target and press the button.</div>
+    <div class="scroll mono" id="pro-recent" style="max-height:140px;margin-top:8px"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Results</h3>
+    <div class="tab-row">
+      <div class="tab active" data-protab="overview">Overview &amp; Risk</div>
+      <div class="tab" data-protab="subs">Subdomains</div>
+      <div class="tab" data-protab="ports">Ports</div>
+      <div class="tab" data-protab="hosts">HTTP Hosts</div>
+      <div class="tab" data-protab="dns">DNS</div>
+      <div class="tab" data-protab="takeover">Takeover</div>
+      <div class="tab" data-protab="lookalikes">Lookalikes</div>
+      <div class="tab" data-protab="timemachine">⏳ Time Machine</div>
+      <div class="tab" data-protab="graph">Graph</div>
+    </div>
+    <div id="pro-tab-overview">
+      <div class="cards" id="pro-risk-cards"></div>
+      <div class="mono" id="pro-diffline" style="color:var(--orange);margin:4px 0 10px"></div>
+      <table id="pro-findings"><thead><tr><th style="width:70px">Severity</th><th>Finding</th><th>Detail</th><th>Recommended fix</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div id="pro-tab-subs" class="scroll" style="display:none;max-height:420px"><table><thead><tr><th>Subdomain</th><th>Sources</th></tr></thead><tbody></tbody></table></div>
+    <div id="pro-tab-ports" class="scroll" style="display:none;max-height:420px"><table><thead><tr><th>Host</th><th>IP</th><th>Open ports</th></tr></thead><tbody></tbody></table></div>
+    <div id="pro-tab-hosts" class="scroll" style="display:none;max-height:420px"><table><thead><tr><th>Host</th><th>Status</th><th>Title</th><th>Tech</th><th>Header grade</th></tr></thead><tbody></tbody></table></div>
+    <div id="pro-tab-dns" style="display:none"><div class="kv" id="pro-dns-kv" style="margin-top:8px"></div></div>
+    <div id="pro-tab-takeover" class="scroll" style="display:none;max-height:420px"><table><thead><tr><th>Status</th><th>Subdomain</th><th>CNAME</th><th>Service</th><th>Evidence</th></tr></thead><tbody></tbody></table></div>
+    <div id="pro-tab-lookalikes" class="scroll" style="display:none;max-height:420px"><table><thead><tr><th>Domain</th><th>Technique</th><th>IPs</th><th>State</th><th>Title</th></tr></thead><tbody></tbody></table></div>
+    <div id="pro-tab-timemachine" style="display:none">
+      <div class="input-row">
+        <select id="tm-a" size="1"></select>
+        <select id="tm-b"></select>
+        <button class="btn btn-primary" onclick="tmDiff()">⇄ Diff snapshots</button>
+        <button class="btn btn-outline" onclick="loadSnapshotList()">⟳ reload</button>
+      </div>
+      <div class="legal">Every Pro Recon run stores an attack-surface snapshot with a 12-char <b>DNA fingerprint</b>. Diff two snapshots to see exactly what changed (new subs, ports, tech, certs).</div>
+      <div id="tm-out" class="mono" style="max-height:380px;overflow:auto"></div>
+    </div>
+    <div id="pro-tab-graph" style="display:none"><div id="pro-graph" style="height:440px;background:var(--bg);border-radius:8px;border:1px solid var(--border)"></div></div>
+  </div>
+
+  <div class="panel">
+    <h3>🧰 Standalone intel tools</h3>
+    <div class="grid-2">
+      <div>
+        <h4 style="font-size:12px;color:var(--accent);margin:8px 0 4px">DNS intelligence</h4>
+        <div class="input-row"><input id="tool-dns-target" placeholder="domain" size="24"><button class="btn" onclick="toolDns()">Dump records</button></div>
+        <pre class="mono scroll" id="tool-dns-out" style="max-height:200px"></pre>
+        <h4 style="font-size:12px;color:var(--accent);margin:8px 0 4px">Security-header grade</h4>
+        <div class="input-row"><input id="tool-hdr-target" placeholder="host" size="24"><button class="btn" onclick="toolHeaders()">Grade it</button></div>
+        <div id="tool-hdr-out" style="font-size:12px"></div>
+        <h4 style="font-size:12px;color:var(--accent);margin:8px 0 4px">WHOIS / RDAP (keyless)</h4>
+        <div class="input-row"><input id="tool-whois-target" placeholder="domain or IP" size="24"><button class="btn" onclick="toolWhois()">Lookup</button></div>
+        <pre class="mono scroll" id="tool-whois-out" style="max-height:200px"></pre>
+      </div>
+      <div>
+        <h4 style="font-size:12px;color:var(--accent);margin:8px 0 4px">Subdomain takeover scan</h4>
+        <div class="input-row"><input id="tool-to-target" placeholder="target (uses known subdomains)" size="24"><button class="btn" onclick="toolTakeover()">Scan CNAMEs</button></div>
+        <pre class="mono scroll" id="tool-to-out" style="max-height:200px"></pre>
+        <h4 style="font-size:12px;color:var(--accent);margin:8px 0 4px">Lookalike-domain radar</h4>
+        <div class="input-row"><input id="tool-look-target" placeholder="domain" size="24"><label><input type="checkbox" id="tool-look-probe" checked> http probe</label><button class="btn" onclick="toolLookalike()">Run radar</button></div>
+        <pre class="mono scroll" id="tool-look-out" style="max-height:200px"></pre>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -311,6 +402,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
           <option value="httpx">httpx</option>
           <option value="ffuf">ffuf</option>
           <option value="nmap">nmap</option>
+          <option value="nuclei">nuclei</option>
+          <option value="katana">katana</option>
           <option value="dig">dig</option>
           <option value="whois">whois</option>
           <option value="curl">curl</option>
@@ -846,6 +939,145 @@ async function loadReport(){
   document.querySelector('#ph-table tbody').innerHTML=ph.map(p=>`<tr><td style="font-size:10px;color:var(--dim)">${new Date(p.first_seen+'Z').toLocaleString()}</td><td class="mono">${p.device_mac}</td><td class="mono">${p.device_ip}</td><td>${p.port}</td><td>${p.service}</td><td>${p.scan_type||''}</td><td>${p.is_new?'<span class="badge badge-warn">NEW</span>':''}</td></tr>`).join('');
 }
 
+// --------- Pro Recon ---------
+let proPoll=null, proLastJob=null, proGraphDrawn=false;
+const PRO_TABS=['overview','subs','ports','hosts','dns','takeover','lookalikes','timemachine','graph'];
+document.querySelectorAll('.tab[data-protab]').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab[data-protab]').forEach(x=>x.classList.remove('active')); t.classList.add('active');
+  PRO_TABS.forEach(n=>{const el=document.getElementById('pro-tab-'+n); if(el) el.style.display='none';});
+  document.getElementById('pro-tab-'+t.dataset.protab).style.display='block';
+  if(t.dataset.protab==='graph') drawProGraph();
+}));
+async function startProRecon(){
+  const t=document.getElementById('pro-target').value.trim(); if(!t){flash('target required','error');return;}
+  const profile=document.getElementById('pro-profile').value;
+  if(profile==='full' && !confirm('FULL profile: adds lookalike radar, WHOIS/IP intel and a ~370-path deep-web sweep (hundreds of requests).\n\nOnly proceed for targets you are authorized to test. Continue?')) return;
+  document.getElementById('pro-log').textContent='Starting…';
+  document.getElementById('pro-report-btn').style.display='none';
+  document.getElementById('pro-summaryline').textContent='';
+  try{
+    const r=await api('POST','/api/prorecon/start',{target:t,profile});
+    flash('Pro recon started: '+r.job_id);
+    pollPro(r.job_id);
+  }catch(e){flash(e.message,'error');}
+}
+function pollPro(jid){
+  if(proPoll)clearInterval(proPoll);
+  const t0=Date.now();
+  proPoll=setInterval(async()=>{
+    try{
+      const j=await api('GET','/api/prorecon/jobs/'+jid);
+      renderProJob(j.job);
+      if(j.job.status==='done'||j.job.status==='failed'){clearInterval(proPoll);proPoll=null;loadProJobs();loadSnapshotList();
+        if(j.job.status==='done')flash('Recon complete: '+(j.job.summary||''));else flash('Recon failed: '+(j.job.error||''),'error');}
+      if(Date.now()-t0>12*60*1000)clearInterval(proPoll);
+    }catch(e){}
+  },1300);
+}
+function renderProJob(job){
+  proLastJob=job;
+  const log=document.getElementById('pro-log');
+  log.textContent=(job.log&&job.log.length?job.log.join('\n'):'…working…');
+  log.scrollTop=log.scrollHeight;
+  const ph=document.getElementById('pro-phases');
+  ph.innerHTML=Object.entries(job.phases||{}).map(([k,v])=>`<span class="phase-chip ${v}">${k}</span>`).join('');
+  document.getElementById('pro-summaryline').textContent=`[${job.status}] ${job.target||''} ${job.summary||''}${job.error?' • error: '+job.error:''}`;
+  if(job.status==='done'){
+    const rb=document.getElementById('pro-report-btn');
+    rb.style.display='inline-flex'; rb.href='/api/recon/report/'+job.job_id+'.html';
+    renderProResult(job.result||{});
+  }
+}
+function sevBadge(s){const m={high:'badge-crit',medium:'badge-warn',low:'badge-info',info:'badge-muted'};return `<span class="badge ${m[s]||'badge-muted'}">${s}</span>`;}
+function gradeBadge(g){if(!g)return '<span class="badge badge-muted">—</span>';const cls=['A+','A','B'].includes(g)?'badge-on':(g==='C'?'badge-warn':'badge-crit');return `<span class="badge ${cls}">${g}</span>`;}
+function renderProResult(r){
+  const risk=r.risk||{};
+  const nPorts=Object.values(r.ports||{}).reduce((a,b)=>a+(b.ports||[]).length,0);
+  document.getElementById('pro-risk-cards').innerHTML=`
+    <div class="stat-card"><div class="lbl">Exposure score</div><div class="val risk-big">${risk.score!=null?risk.score:'—'}<span style="font-size:16px;color:var(--dim)">/100</span></div><div class="sub">grade ${gradeBadge(risk.grade||'')}</div></div>
+    <div class="stat-card"><div class="lbl">Findings</div><div class="val">${(risk.findings||[]).length}</div><div class="sub">prioritized</div></div>
+    <div class="stat-card"><div class="lbl">Subdomains</div><div class="val">${(r.subdomains||[]).length}</div><div class="sub">multi-source</div></div>
+    <div class="stat-card"><div class="lbl">Open ports</div><div class="val">${nPorts}</div><div class="sub">${Object.keys(r.ports||{}).length} hosts</div></div>
+    <div class="stat-card"><div class="lbl">Takeover candidates</div><div class="val" style="color:var(--red)">${(r.takeover||[]).filter(t=>t.status==='vulnerable').length}</div><div class="sub">of ${(r.takeover||[]).length} dangling</div></div>
+    <div class="stat-card"><div class="lbl">Lookalikes live</div><div class="val" style="color:var(--orange)">${(r.lookalikes||[]).filter(l=>l.live).length}</div><div class="sub">of ${(r.lookalikes||[]).length} resolving</div></div>`;
+  const diff=r.diff||{};
+  const proxyWarn=r.ports_unreliable?'⚠️ Port sweep UNRELIABLE from this vantage point (transparent proxy/tarpit detected by canary check) — ':'';
+  document.getElementById('pro-diffline').textContent=proxyWarn+(diff.first_snapshot?`Snapshot DNA ${r.dna||''} — first baseline stored`:(diff.changed?`⚠ ATTACK SURFACE CHANGED vs previous snapshot (dna ${r.dna||''}) — see Time Machine`:(diff.changed===false&&r.dna?`Surface DNA ${r.dna} — unchanged vs last snapshot`:'')));
+  document.querySelector('#pro-findings tbody').innerHTML=(risk.findings||[]).map(f=>`<tr><td>${sevBadge(f.severity)}</td><td>${escapeHtml(f.title||'')}</td><td style="color:var(--dim)">${escapeHtml(f.detail||'')}</td><td>${escapeHtml(f.fix||'')}</td></tr>`).join('')||'<tr><td colspan=4>No findings.</td></tr>';
+  document.querySelector('#pro-tab-subs tbody').innerHTML=(r.subdomains||[]).map(s=>`<tr><td class="mono">${escapeHtml(s.subdomain)}</td><td>${(s.sources||[]).map(x=>`<span class="pill">${x}</span>`).join('')}</td></tr>`).join('')||'<tr><td colspan=2>—</td></tr>';
+  document.querySelector('#pro-tab-ports tbody').innerHTML=Object.entries(r.ports||{}).map(([h,i])=>`<tr><td class="mono">${escapeHtml(h)}</td><td class="mono">${escapeHtml(i.ip||'')}</td><td>${(i.ports||[]).map(p=>`<span class="pill">${p}</span>`).join('')}</td></tr>`).join('')||'<tr><td colspan=3>—</td></tr>';
+  document.querySelector('#pro-tab-hosts tbody').innerHTML=(r.hosts||[]).map(h=>`<tr><td class="mono"><a href="${h.url||'#'}" target="_blank" rel="noopener" style="color:var(--accent)">${escapeHtml(h.host)}</a></td><td><span class="badge ${h.status_code>=200&&h.status_code<400?'badge-on':'badge-warn'}">${h.status_code||'?'}</span></td><td>${escapeHtml(h.title||'')}</td><td>${(h.tech||[]).map(x=>`<span class="pill">${x}</span>`).join('')}</td><td>${gradeBadge((h.headers_grade||{}).grade)}</td></tr>`).join('')||'<tr><td colspan=5>—</td></tr>';
+  const dns=(r.dns&&r.dns.records)||{};
+  document.getElementById('pro-dns-kv').innerHTML=Object.entries(dns).map(([k,v])=>`<div class="k">${k}</div><div class="v mono">${escapeHtml((v||[]).slice(0,12).join('  •  '))}</div>`).join('')||'<div class="k">—</div><div class="v">no records</div>';
+  const toBadge={vulnerable:'badge-crit',potential:'badge-warn',review:'badge-info'};
+  document.querySelector('#pro-tab-takeover tbody').innerHTML=(r.takeover||[]).map(t=>`<tr><td><span class="badge ${toBadge[t.status]||'badge-muted'}">${t.status}</span></td><td class="mono">${escapeHtml(t.subdomain)}</td><td class="mono">${escapeHtml(t.cname)}</td><td>${escapeHtml(t.service||'dangling')}</td><td style="color:var(--dim)">${escapeHtml(t.evidence||'')}</td></tr>`).join('')||'<tr><td colspan=5>none found</td></tr>';
+  document.querySelector('#pro-tab-lookalikes tbody').innerHTML=(r.lookalikes||[]).map(l=>`<tr><td class="mono">${escapeHtml(l.domain)}</td><td><span class="pill">${escapeHtml(l.technique)}</span></td><td class="mono">${(l.ips||[]).join(', ')}</td><td>${l.live?'<span class="badge badge-crit">LIVE</span>':'<span class="badge badge-muted">resolves</span>'}</td><td>${escapeHtml(l.title||'')}</td></tr>`).join('')||'<tr><td colspan=5>'+(r.profile==='full'||r.lookalikes?'none resolving':'run FULL profile')+'</td></tr>';
+  proGraphDrawn=false;
+}
+function drawProGraph(){
+  if(proGraphDrawn)return;
+  const el=document.getElementById('pro-graph');
+  const g=(proLastJob&&proLastJob.result&&proLastJob.result.graph)||null;
+  if(!g||!(g.nodes||[]).length){el.innerHTML='<div style="padding:40px;text-align:center;color:var(--dim)">Run a Pro Recon job first (graph is built from its results).</div>';return;}
+  if(window.__cdnFailed||typeof vis==='undefined'){el.innerHTML='<div style="padding:40px;text-align:center;color:var(--dim)">Graph unavailable (vis.js CDN blocked). '+g.nodes.length+' nodes / '+g.edges.length+' edges computed.</div>';return;}
+  const colors={root:'#a855f7',subdomain:'#00d4ff',ip:'#64748b',port:'#00ff88',risky_port:'#ffa502',takeover:'#ff4757'};
+  const nodes=g.nodes.map(n=>({id:n.id,label:n.label,title:n.title,color:colors[n.group]||'#00d4ff',shape:n.group==='takeover'?'diamond':'dot'}));
+  el.innerHTML='';
+  new vis.Network(el,{nodes:new vis.DataSet(nodes),edges:new vis.DataSet(g.edges)},{physics:{barnesHut:{gravitationalConstant:-9000,springLength:95}},nodes:{font:{color:'#e2e8f0',size:10}},edges:{color:'#1e2d3d',font:{color:'#64748b',size:8,strokeWidth:0}}});
+  proGraphDrawn=true;
+}
+async function loadProJobs(){
+  try{
+    const jobs=await api('GET','/api/prorecon/jobs');
+    document.getElementById('pro-recent').innerHTML=jobs.slice(0,10).map(j=>`<div style="padding:3px 0"><span class="badge ${j.status==='done'?'badge-on':(j.status==='failed'?'badge-crit':'badge-warn')}">${j.status}</span> <b>${escapeHtml(j.target)}</b> <span style="color:var(--dim);font-size:10px">${(j.started_at||'').slice(5,16)} ${j.profile||''}</span> ${escapeHtml(j.summary||'')} <a href="#" onclick="viewProJob('${j.job_id}');return false" style="color:var(--accent)">view</a></div>`).join('')||'no jobs yet';
+  }catch(e){}
+}
+async function viewProJob(id){
+  try{const j=await api('GET','/api/prorecon/jobs/'+id); renderProJob(j.job); if(j.job.status==='done')renderProResult(j.job.result||{});}catch(e){flash(e.message,'error');}
+}
+async function loadSnapshotList(){
+  try{
+    const snaps=await api('GET','/api/recon/snapshots');
+    const opts=snaps.map(s=>`<option value="${s.id}">#${s.id} ${escapeHtml(s.target)} • dna ${s.dna} • ${(s.taken_at||'').slice(5,16)}</option>`).join('');
+    document.getElementById('tm-a').innerHTML=opts||'<option value="">no snapshots</option>';
+    document.getElementById('tm-b').innerHTML=opts||'<option value="">no snapshots</option>';
+    if(snaps.length>1)document.getElementById('tm-b').selectedIndex=1;
+  }catch(e){}
+}
+async function tmDiff(){
+  const a=document.getElementById('tm-a').value, b=document.getElementById('tm-b').value;
+  const out=document.getElementById('tm-out');
+  if(!a||!b||a===b){out.textContent='Pick two different snapshots.';return;}
+  out.textContent='Diffing…';
+  try{
+    const r=await api('GET','/api/recon/snapshots/diff?a='+a+'&b='+b);
+    const d=r.diff;
+    out.textContent=
+`A: #${r.a.id} dna ${r.a.dna} (${r.a.taken_at})
+B: #${r.b.id} dna ${r.b.dna} (${r.b.taken_at})
+changed: ${d.changed}
+
+ADDED subdomains (${d.added_subdomains.length}):
+${d.added_subdomains.map(x=>'  + '+x).join('\n')||'  —'}
+REMOVED subdomains (${d.removed_subdomains.length}):
+${d.removed_subdomains.map(x=>'  - '+x).join('\n')||'  —'}
+NEW open ports:
+${Object.entries(d.new_ports).map(([h,v])=>'  + '+h+'  '+v.join(',')).join('\n')||'  —'}
+CLOSED ports:
+${Object.entries(d.closed_ports).map(([h,v])=>'  - '+h+'  '+v.join(',')).join('\n')||'  —'}
+TECH changes:
+${Object.entries(d.tech_changes).map(([h,v])=>'  ~ '+h+': '+(v.before||[]).join('/')+'  ->  '+(v.after||[]).join('/')).join('\n')||'  —'}
+DNS A-record changed: ${d.dns_changed}    TLS cert changed: ${d.cert_changed}`;
+  }catch(e){out.textContent='Error: '+e.message;}
+}
+// standalone intel tools
+function sj(o){return JSON.stringify(o,null,2);}
+async function toolDns(){const t=document.getElementById('tool-dns-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-dns-out').textContent='…';try{const r=await api('POST','/api/recon/dns',{target:t});document.getElementById('tool-dns-out').textContent=sj(r.result);}catch(e){document.getElementById('tool-dns-out').textContent='Error: '+e.message;}}
+async function toolHeaders(){const t=document.getElementById('tool-hdr-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-hdr-out').innerHTML='grading…';try{const r=await api('POST','/api/recon/headers',{target:t});const g=r.result;document.getElementById('tool-hdr-out').innerHTML=`<div style="font-size:20px;margin:6px 0">Grade ${gradeBadge(g.grade)} <span style="color:var(--dim);font-size:12px">${g.score}/100 over ${g.scheme}</span></div><table><thead><tr><th>Header</th><th>Present</th><th>Note</th></tr></thead><tbody>${(g.checks||[]).map(c=>`<tr><td class="mono">${c.header}</td><td>${c.ok?'<span class="badge badge-on">+</span>':'<span class="badge badge-off">missing</span>'}</td><td style="color:var(--dim);font-size:11px">${c.note}</td></tr>`).join('')}</tbody></table>${(g.issues||[]).map(i=>`<div style="color:var(--orange);font-size:11px;margin-top:3px">⚠ ${escapeHtml(i)}</div>`).join('')}`;}catch(e){document.getElementById('tool-hdr-out').textContent='Error: '+e.message;}}
+async function toolWhois(){const t=document.getElementById('tool-whois-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-whois-out').textContent='…';try{const r=await api('POST','/api/recon/whois',{target:t});document.getElementById('tool-whois-out').textContent=sj(r.result);}catch(e){document.getElementById('tool-whois-out').textContent='Error: '+e.message;}}
+async function toolTakeover(){const t=document.getElementById('tool-to-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-to-out').textContent='checking CNAMEs…';try{const r=await api('POST','/api/recon/takeover',{target:t});document.getElementById('tool-to-out').textContent=r.results.length?sj(r.results):`no dangling CNAMEs among ${r.checked} names checked ✓`;}catch(e){document.getElementById('tool-to-out').textContent='Error: '+e.message;}}
+async function toolLookalike(){const t=document.getElementById('tool-look-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-look-out').textContent='generating permutations + resolving…';try{const r=await api('POST','/api/recon/lookalikes',{target:t,probe:document.getElementById('tool-look-probe').checked});document.getElementById('tool-look-out').textContent=r.results.length?sj(r.results):`no live lookalikes among ${r.permutations_checked} permutations ✓`;}catch(e){document.getElementById('tool-look-out').textContent='Error: '+e.message;}}
+
 // --------- Section entry ---------
 function sectionEnter(id){
   try{
@@ -855,6 +1087,7 @@ function sectionEnter(id){
     else if(id==='sec-bandwidth'){loadBw();}
     else if(id==='sec-wifi-audit'){wifiCap();loadWifiAPs();loadWifiHS();loadWifiEvents();}
     else if(id==='sec-recon'){loadReconJobs();}
+    else if(id==='sec-prorecon'){loadProJobs(); loadSnapshotList();}
     else if(id==='sec-bugbounty'){loadBBTargets(); const t=document.getElementById('bb-job-target').value; if(t) loadBBFindings(t);}
     else if(id==='sec-security'){loadSecurity();}
     else if(id==='sec-live-traffic'){loadLive();}
