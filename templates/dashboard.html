@@ -125,6 +125,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   <button class="nav-item" data-go="sec-bugbounty"><span class="icon">🎯</span>Bug Bounty</button>
   <button class="nav-item" data-go="sec-security"><span class="icon">🛡️</span>Security &amp; Alerts</button>
   <button class="nav-item" data-go="sec-live-traffic"><span class="icon">👁️</span>Live Traffic / PCAP</button>
+  <button class="nav-item" data-go="sec-mitm"><span class="icon">🕸️</span>MITM Lab</button>
   <button class="nav-item" data-go="sec-ai"><span class="icon">🧠</span>AI Brain</button>
   <button class="nav-item" data-go="sec-settings"><span class="icon">⚙️</span>Settings &amp; Tools</button>
   <button class="nav-item" data-go="sec-reports"><span class="icon">📄</span>Reports</button>
@@ -238,6 +239,34 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
       <button class="btn btn-danger" onclick="wifiStopHS()">Stop</button>
     </div>
     <div class="scroll" style="max-height:360px"><table id="hs-table"><thead><tr><th>Time</th><th>BSSID</th><th>SSID</th><th>Station</th><th>EAPOL</th><th>PMKID</th><th>Files</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <div class="panel">
+    <h3>🧪 WiFi Pentest Wizard <span class="tag">one-click full audit</span></h3>
+    <div class="input-row">
+      <input id="audit-bssid" placeholder="target BSSID (blank = all APs)" size="22">
+      <label>survey <input id="audit-survey" type="number" value="45" style="width:64px">s</label>
+      <label>handshake <input id="audit-hs" type="number" value="90" style="width:64px">s</label>
+      <label><input type="checkbox" id="audit-deauth"> deauth to force handshakes</label>
+      <button class="btn btn-primary" onclick="wifiAuditStart()">🚀 Run one-click WiFi audit</button>
+    </div>
+    <div id="audit-phases" class="input-row"></div>
+    <div class="log-terminal" id="audit-log" style="height:170px">Idle.</div>
+    <div id="audit-findings" class="mono" style="margin-top:6px;color:var(--yellow)"></div>
+  </div>
+  <div class="panel">
+    <h3>🔓 Crack Lab <span class="tag">hashcat -m 22000 / aircrack-ng</span></h3>
+    <div class="input-row">
+      <select id="crack-wl"></select>
+      <button class="btn btn-sm" onclick="loadWordlists()">⟳ wordlists</button>
+      <button class="btn btn-danger btn-sm" id="crack-stop-btn" style="display:none" onclick="crackStop()">■ Stop job</button>
+    </div>
+    <div id="crack-status" class="mono">Pick a wordlist, then press <b>crack</b> on any handshake with a 22000 blob above. Add wordlists to the <code>wordlists/</code> directory.</div>
+    <div class="log-terminal" id="crack-log" style="height:200px;margin-top:6px"></div>
+  </div>
+  <div class="panel">
+    <h3>🛠 Adapter &amp; toolchain capabilities</h3>
+    <div class="input-row"><button class="btn" onclick="loadWifiCaps()">🔍 Scan capabilities</button></div>
+    <div id="wifi-caps" class="mono" style="font-size:11px"></div>
   </div>
   <div class="panel"><h3>WiFi event log</h3><div class="scroll" id="wifi-events" style="max-height:280px"></div></div>
 </section>
@@ -436,6 +465,39 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
     <div class="header-actions"><button class="btn btn-success" onclick="capStart()">▶ Capture</button><button class="btn btn-danger" onclick="capStop()">■ Stop</button><button class="btn" onclick="capClear()">Clear</button></div></div>
   <div class="panel"><h3>Live HTTP/DNS/TLS streams</h3><div class="scroll" style="max-height:400px"><table id="live-table"><thead><tr><th>Time</th><th>Type</th><th>From</th><th>Domain/Info</th></tr></thead><tbody></tbody></table></div></div>
   <div class="panel"><h3>Captured packets</h3><div class="scroll" style="max-height:400px"><table id="cap-table"><thead><tr><th>Time</th><th>Proto</th><th>Src</th><th>Dst</th><th>Sport</th><th>Dport</th><th>Flags/Len</th></tr></thead><tbody></tbody></table></div></div>
+</section>
+
+<!-- ============= MITM LAB ============= -->
+<section class="section" id="sec-mitm">
+  <div class="page-header"><div><h2>🕸 MITM Lab — One-Click ARP Relay</h2><div class="sub">Pick a device, press start: forwarding + ARP poisoning + traffic viewer in one click</div></div></div>
+  <div class="legal">⚠️ Authorized lab only — intercept traffic of devices on networks YOU own with owner permission.</div>
+  <div class="legal" style="border-left-color:var(--orange)">ℹ️ TLS contents are <b>not decrypted</b> (no sslstrip). You will see HTTP hostnames, DNS queries and TLS SNI — enough for an audit of where devices talk.</div>
+  <div class="panel">
+    <h3>Wizard <span class="tag" id="mitm-tag">checking…</span></h3>
+    <div class="input-row">
+      <select id="mitm-target" style="min-width:240px"><option value="">— pick discovered device —</option></select>
+      <input id="mitm-target-ip" placeholder="or type IP (192.168.1.50)" size="20">
+      <button class="btn btn-danger" onclick="mitmStart()">▶ Start MITM relay</button>
+      <button class="btn btn-success" onclick="mitmStop()">■ Stop &amp; restore</button>
+      <button class="btn" onclick="mitmStatus()">⟳ Status</button>
+    </div>
+    <div id="mitm-status" class="kv"></div>
+    <div class="cards" id="mitm-cards" style="margin-top:12px"></div>
+  </div>
+  <div class="panel">
+    <h3>Intercepted traffic from victim <span class="tag">HTTP / DNS / TLS-SNI</span></h3>
+    <div class="scroll" style="max-height:420px"><table id="mitm-live"><thead><tr><th>Time</th><th>Type</th><th>Domain / Info</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <div class="panel">
+    <h3>DNS spoof rules <span class="tag">lab</span></h3>
+    <div class="input-row">
+      <input id="ds-domain" placeholder="domain (e.g. example.com)" size="24">
+      <input id="ds-ip" placeholder="fake ip (e.g. 192.168.1.10)" size="16">
+      <button class="btn btn-primary" onclick="dsAdd()">+ Add rule</button>
+      <button class="btn" onclick="dsLoad()">⟳</button>
+    </div>
+    <div id="ds-list" class="mono"></div>
+  </div>
 </section>
 
 <!-- ============= AI BRAIN ============= -->
@@ -688,7 +750,7 @@ async function loadWifiHS(){
     <td class="mono">${h.bssid}</td><td>${escapeHtml(h.ssid||'')}</td><td class="mono">${h.station_mac||'—'}</td>
     <td>${h.has_eapol?'<span class="badge badge-on">yes</span>':'<span class="badge badge-muted">—</span>'}</td>
     <td>${h.has_pmkid?'<span class="badge badge-warn">pmkid</span>':''}</td>
-    <td>${h.pcap_path?`<a class="btn btn-sm" href="/api/wifi/handshakes/${h.id}/pcap">pcap</a>`:''} ${h.hashcat_22000?`<a class="btn btn-sm" href="/api/wifi/handshakes/${h.id}/hashcat">22000</a>`:''}</td>
+    <td>${h.pcap_path?`<a class="btn btn-sm" href="/api/wifi/handshakes/${h.id}/pcap">pcap</a>`:''} ${h.hashcat_22000?`<a class="btn btn-sm" href="/api/wifi/handshakes/${h.id}/hashcat">22000</a>`:''} ${h.hashcat_22000||h.pcap_path?`<button class="btn btn-sm btn-danger" onclick="startCrack(${h.id})">crack</button>`:''} ${h.cracked_password?`<span class="badge badge-on">✓ ${escapeHtml(h.cracked_password)}</span>`:''}</td>
   </tr>`).join('');
 }
 async function wifiStartHS(){
@@ -1078,6 +1140,147 @@ async function toolWhois(){const t=document.getElementById('tool-whois-target').
 async function toolTakeover(){const t=document.getElementById('tool-to-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-to-out').textContent='checking CNAMEs…';try{const r=await api('POST','/api/recon/takeover',{target:t});document.getElementById('tool-to-out').textContent=r.results.length?sj(r.results):`no dangling CNAMEs among ${r.checked} names checked ✓`;}catch(e){document.getElementById('tool-to-out').textContent='Error: '+e.message;}}
 async function toolLookalike(){const t=document.getElementById('tool-look-target').value.trim();if(!t)return flash('target required','error');document.getElementById('tool-look-out').textContent='generating permutations + resolving…';try{const r=await api('POST','/api/recon/lookalikes',{target:t,probe:document.getElementById('tool-look-probe').checked});document.getElementById('tool-look-out').textContent=r.results.length?sj(r.results):`no live lookalikes among ${r.permutations_checked} permutations ✓`;}catch(e){document.getElementById('tool-look-out').textContent='Error: '+e.message;}}
 
+// --------- MITM Lab ---------
+async function mitmTarget(){
+  const ip=document.getElementById('mitm-target-ip').value.trim();
+  if(ip)return ip;
+  const sel=document.getElementById('mitm-target');
+  return sel.value||'';
+}
+function loadMitmTargets(){
+  const sel=document.getElementById('mitm-target');
+  const online=devicesCache.filter(d=>d.is_online&&d.ip);
+  sel.innerHTML='<option value="">— pick discovered device —</option>'+online.map(d=>`<option value="${d.ip}">${escapeHtml(d.custom_name||d.hostname||d.vendor||'device')} • ${d.ip}</option>`).join('');
+}
+async function mitmStart(){
+  const ip=await mitmTarget();
+  if(!ip)return flash('pick a device or type an IP','error');
+  if(!confirm(`Start a full MITM relay on ${ip}?\n\nThis enables IP forwarding + ARP poisoning + traffic capture (your LAN, authorized lab only).\n\nThe device keeps internet access while its HOSTNAMES/DNS are visible here. TLS content is NOT decrypted. Continue?`))return;
+  try{const r=await api('POST','/api/mitm/wizard/start',{target:ip}); flash(r.message); await mitmStatus();}catch(e){flash(e.message,'error');}
+}
+async function mitmStop(){try{const r=await api('POST','/api/mitm/wizard/stop',{}); flash(r.message); await mitmStatus();}catch(e){flash(e.message,'error');}}
+async function mitmStatus(){
+  try{
+    const s=await api('GET','/api/mitm/wizard/status');
+    const tag=document.getElementById('mitm-tag');
+    tag.textContent=s.active?('RELAYING '+s.target_ip):'idle';
+    tag.className='tag '+(s.active?'badge-crit':'badge-muted');
+    document.getElementById('mitm-status').innerHTML=`
+      <div class="k">State</div><div class="v">${s.active?`MITM relay ACTIVE on <b>${s.target_ip}</b> since ${(s.started_at||'').slice(11,19)}`:'not running'}</div>
+      <div class="k">IP forwarding</div><div class="v">${s.ip_forward==='1'?'<span class="badge badge-warn">ON</span> (packets relayed)':'<span class="badge badge-on">off</span>'}</div>
+      <div class="k">Note</div><div class="v">${escapeHtml(s.forwarding_note||'')}</div>`;
+    document.getElementById('mitm-cards').innerHTML=`
+      <div class="stat-card"><div class="lbl">HTTP hosts seen</div><div class="val">${s.intercepted.http}</div><div class="sub">plaintext hostnames</div></div>
+      <div class="stat-card"><div class="lbl">DNS queries</div><div class="val">${s.intercepted.dns}</div><div class="sub">from victim</div></div>
+      <div class="stat-card"><div class="lbl">TLS SNI</div><div class="val">${s.intercepted.tls_sni}</div><div class="sub">encrypted destinations</div></div>`;
+    if(s.active)mitmLive(s.target_ip);
+  }catch(e){}
+}
+async function mitmLive(victim){
+  const live=await api('GET','/api/live-traffic?limit=400');
+  const rows=live.filter(l=>!victim||l.source_ip===victim).slice(-80).reverse();
+  document.querySelector('#mitm-live tbody').innerHTML=rows.map(l=>`<tr><td style="font-size:10px;color:var(--dim)">${new Date(l.timestamp+'Z').toLocaleTimeString()}</td><td><span class="badge ${l.type==='HTTP'?'badge-warn':'badge-info'}">${l.type}</span></td><td>${escapeHtml(l.domain||l.details||'')}</td></tr>`).join('')||'<tr><td colspan=3>No intercepted traffic yet — browse on the victim device.</td></tr>';
+}
+async function dsLoad(){
+  const rules=await api('GET','/api/dns-spoof-rules');
+  document.getElementById('ds-list').innerHTML=rules.map(r=>`<div style="padding:4px 0">${escapeHtml(r.domain)} → <b>${r.fake_ip}</b> <button class="btn btn-sm btn-danger" onclick="dsDel('${r.domain.replace(/'/g,"\\'")}')">del</button></div>`).join('')||'no rules';
+}
+async function dsAdd(){
+  const d=document.getElementById('ds-domain').value.trim(), i=document.getElementById('ds-ip').value.trim();
+  if(!d||!i)return flash('domain + fake ip required','error');
+  try{const r=await api('POST','/api/dns-spoof-rules',{domain:d,fake_ip:i}); flash(r.message); await dsLoad();}catch(e){flash(e.message,'error');}
+}
+async function dsDel(d){await api('DELETE','/api/dns-spoof-rules/'+encodeURIComponent(d)); await dsLoad();}
+
+// --------- WiFi caps + audit wizard + crack lab ---------
+async function loadWifiCaps(){
+  const out=document.getElementById('wifi-caps'); out.textContent='scanning…';
+  const c=await api('GET','/api/wifi/capabilities');
+  let h=`platform: ${c.platform}  root: ${c.is_root?'<span class=\"badge badge-on\">yes</span>':'<span class=\"badge badge-off\">NO — monitor/injection needs sudo</span>'}\n\n`;
+  h+='INTERFACES\n'+(c.interfaces.length?c.interfaces.map(i=>`  ${i.name}  driver=${i.driver||'?'} ${i.chip_hint?'\n    → '+i.chip_hint:''}`).join('\n'):'  none detected\n');
+  h+='\nTOOLS\n'+Object.entries(c.tools).map(([k,v])=>`  ${v?'✅':'❌'} ${k}`).join('\n');
+  if(c.chip_hints.length)h+='\n\nCHIPSET HINTS\n'+c.chip_hints.map(x=>'  • '+x).join('\n');
+  if(c.recommendations.length)h+='\n\nRECOMMENDATIONS\n'+c.recommendations.map(x=>'  ⚠ '+x).join('\n');
+  out.textContent=h;
+}
+let auditPoll=null;
+async function wifiAuditStart(){
+  const bssid=document.getElementById('audit-bssid').value.trim();
+  const deauth=document.getElementById('audit-deauth').checked;
+  const body={survey_seconds:parseInt(document.getElementById('audit-survey').value)||45,
+              handshake_seconds:parseInt(document.getElementById('audit-hs').value)||90,
+              deauth:deauth, confirmed:deauth};
+  if(bssid)body.bssid=bssid;
+  if(deauth && !confirm('Deauth frames disconnect clients on YOUR network briefly to force re-handshakes. Authorized lab only. Continue?'))return;
+  document.getElementById('audit-log').textContent='Starting audit…';
+  try{
+    const r=await api('POST','/api/wifi/audit/start',body);
+    flash('WiFi audit started: '+r.job_id);
+    if(auditPoll)clearInterval(auditPoll);
+    const t0=Date.now();
+    auditPoll=setInterval(async()=>{
+      try{
+        const j=await api('GET','/api/wifi/audit/jobs/'+r.job_id);
+        const job=j.job;
+        document.getElementById('audit-phases').innerHTML=Object.entries(job.phases||{}).map(([k,v])=>`<span class="phase-chip ${v}">${k}</span>`).join('');
+        const log=document.getElementById('audit-log');
+        log.textContent=(job.log||[]).join('\n')||'…'; log.scrollTop=log.scrollHeight;
+        if(job.status==='done'||job.status==='failed'){
+          clearInterval(auditPoll);
+          const res=job.result||{};
+          document.getElementById('audit-findings').innerHTML=(res.findings||[]).map(f=>'⚠ '+escapeHtml(f)).join('<br>');
+          await loadWifiAPs(); await loadWifiHS();
+          flash(job.status==='done'?`Audit done: ${res.aps||0} APs, ${res.handshakes||0} new handshakes (${res.crackable||0} crackable)`:'Audit failed: '+job.error);
+        }
+        if(Date.now()-t0>20*60*1000)clearInterval(auditPoll);
+      }catch(e){}
+    },1500);
+  }catch(e){flash(e.message,'error');}
+}
+async function loadWordlists(){
+  try{
+    const r=await api('GET','/api/wifi/wordlists');
+    document.getElementById('crack-wl').innerHTML=(r.wordlists||[]).map(w=>`<option value="${w.name}">${w.name} (${w.lines||Math.round(w.size/9)} words)</option>`).join('')||'<option value="">no wordlists in '+escapeHtml(r.dir)+'</option>';
+  }catch(e){}
+}
+let crackJob=null, crackPoll=null;
+async function startCrack(hid){
+  const wl=document.getElementById('crack-wl').value;
+  if(!wl)return flash('pick a wordlist first (refresh wordlists)','error');
+  if(!confirm(`Run crack lab on handshake #${hid} with '${wl}'?\n\nThis attempts the passphrase of YOUR captured handshake against the wordlist on this machine (CPU/GPU heavy). Continue?`))return;
+  document.getElementById('crack-log').textContent='launching…';
+  try{
+    const r=await api('POST',`/api/wifi/handshakes/${hid}/crack`,{wordlist:wl});
+    crackJob=r.job_id;
+    document.getElementById('crack-stop-btn').style.display='inline-flex';
+    document.getElementById('crack-status').textContent=`job ${r.job_id} (${r.engine}) running…`;
+    if(crackPoll)clearInterval(crackPoll);
+    crackPoll=setInterval(async()=>{
+      try{
+        const j=await api('GET','/api/wifi/crack/'+crackJob);
+        const job=j.job;
+        const log=document.getElementById('crack-log');
+        log.textContent=(job.log||[]).slice(-80).join('\n'); log.scrollTop=log.scrollHeight;
+        document.getElementById('crack-status').textContent=`[${job.status}] engine=${job.engine} wl=${job.wordlist}`;
+        if(['cracked','done','failed','stopped'].includes(job.status)){
+          clearInterval(crackPoll);
+          document.getElementById('crack-stop-btn').style.display='none';
+          if(job.status==='cracked'){
+            document.getElementById('crack-status').innerHTML=`🔓 <b style="color:var(--accent2)">CRACKED:</b> <code style="font-size:16px;color:var(--accent2)">${escapeHtml(job.password)}</code> — rotate this passphrase!`;
+            flash('Passphrase cracked — see Crack Lab','error');
+          }else if(job.status==='done'){
+            document.getElementById('crack-status').textContent='Wordlist exhausted — passphrase not found (good sign).';
+          }else{
+            document.getElementById('crack-status').textContent='Job '+job.status+': '+(job.log||[]).slice(-1);
+          }
+          await loadWifiHS();
+        }
+      }catch(e){}
+    },1500);
+  }catch(e){flash(e.message,'error'); document.getElementById('crack-log').textContent='Error: '+e.message;}
+}
+async function crackStop(){if(crackJob){await api('POST','/api/wifi/crack/'+crackJob+'/stop',{}); flash('stopping…');}}
+
 // --------- Section entry ---------
 function sectionEnter(id){
   try{
@@ -1085,12 +1288,13 @@ function sectionEnter(id){
     else if(id==='sec-devices'){loadDevices();}
     else if(id==='sec-network-map'){loadDevices();}
     else if(id==='sec-bandwidth'){loadBw();}
-    else if(id==='sec-wifi-audit'){wifiCap();loadWifiAPs();loadWifiHS();loadWifiEvents();}
+    else if(id==='sec-wifi-audit'){wifiCap();loadWifiAPs();loadWifiHS();loadWifiEvents();loadWifiCaps();loadWordlists();}
     else if(id==='sec-recon'){loadReconJobs();}
     else if(id==='sec-prorecon'){loadProJobs(); loadSnapshotList();}
     else if(id==='sec-bugbounty'){loadBBTargets(); const t=document.getElementById('bb-job-target').value; if(t) loadBBFindings(t);}
     else if(id==='sec-security'){loadSecurity();}
     else if(id==='sec-live-traffic'){loadLive();}
+    else if(id==='sec-mitm'){if(!devicesCache.length){await loadDevices();} loadMitmTargets(); mitmStatus(); dsLoad();}
     else if(id==='sec-ai'){loadAI();}
     else if(id==='sec-settings'){loadSettings();loadTools2();}
     else if(id==='sec-reports'){loadReport();}
@@ -1106,6 +1310,7 @@ async function boot(){
   setInterval(()=>{loadStats(); loadBw(); if(document.getElementById('sec-live-traffic').classList.contains('active')) loadLive();},5000);
   setInterval(()=>{if(document.getElementById('sec-wifi-audit').classList.contains('active')){loadWifiAPs();loadWifiHS();loadWifiEvents();}},6000);
   setInterval(()=>{if(document.getElementById('sec-security').classList.contains('active')) loadSecurity();},10000);
+  setInterval(()=>{if(document.getElementById('sec-mitm')?.classList.contains('active')) mitmStatus();},5000);
   sectionEnter('sec-overview');
 }
 boot().catch(e=>console.error(e));

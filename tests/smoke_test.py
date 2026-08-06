@@ -116,6 +116,8 @@ def check_gets(c: Client):
         "/api/wifi", "/api/wifi/security", "/api/wifi/supported", "/api/wifi/aps",
         "/api/wifi/handshakes", "/api/wifi/events?limit=5",
         "/api/bb/targets", "/api/bb/jobs", "/api/ai/status", "/api/settings",
+        "/api/wifi/capabilities", "/api/wifi/audit/jobs", "/api/wifi/wordlists",
+        "/api/mitm/wizard/status",
     ]
     for path in gets:
         try:
@@ -236,6 +238,68 @@ def flow_post_checks(c: Client):
     _, j = c.get("/api/tools/status")
     record("nuclei" in j and "katana" in j and "nmap" in j, "tools list includes nuclei/katana",
            f"{len(j)} tools")
+
+    # ---- Batch I: WiFi pentest wizard ----
+    _, j = c.get("/api/wifi/capabilities")
+    record(isinstance(j, dict) and "interfaces" in j and "tools" in j and "is_root" in j,
+           "GET /api/wifi/capabilities", f"root={j.get('is_root')} ifaces={len(j.get('interfaces', []))}")
+
+    # audit start on a non-root sandbox should fail gracefully (running job or clean fatal)
+    _, j = c.post("/api/wifi/audit/start", {"survey_seconds": 5, "handshake_seconds": 10})
+    if j.get("success"):
+        job = wait_job(c, f"/api/wifi/audit/jobs/{j['job_id']}", timeout_s=120)
+        record(bool(job) and job.get("status") in ("done", "failed"),
+               "wifi audit job lifecycle", f"status={(job or {}).get('status')} err={(job or {}).get('error', '')[:80]}")
+    else:
+        record(False, "POST /api/wifi/audit/start returns job", str(j))
+
+    # audit start with deauth but no confirm must be rejected with explainable error
+    r, j = c.post("/api/wifi/audit/start", {"deauth": True, "confirmed": False})
+    record(r.status_code == 400 and "confirmed" in j.get("error", ""),
+           "wifi audit deauth confirm-gate")
+
+    # wordlists endpoint lists the demo list
+    _, j = c.get("/api/wifi/wordlists")
+    record(any(w.get("name") == "demo_common.txt" for w in j.get("wordlists", [])),
+           "GET /api/wifi/wordlists has demo list")
+
+    # crack on nonexistent handshake -> clean 4xx JSON, not a stack trace
+    r, j = c.post("/api/wifi/handshakes/9999/crack", {"wordlist": "demo_common.txt"})
+    record(r.status_code == 400 and j.get("success") is False, "crack unknown handshake -> clean error")
+
+    # crack with path traversal wordlist -> rejected (wordlist guard or missing-row guard, both 400)
+    r, j = c.post("/api/wifi/handshakes/1/crack", {"wordlist": "../../../etc/passwd"})
+    record(r.status_code == 400 and j.get("success") is False and "not found" in j.get("error", "").lower(),
+           "crack wordlist path-traversal blocked", j.get("error", ""))
+
+    # ---- Batch I: MITM wizard ----
+    _, j = c.get("/api/mitm/wizard/status")
+    record(isinstance(j, dict) and "intercepted" in j and "ip_forward" in j,
+           "GET /api/mitm/wizard/status", f"active={j.get('active')} fwd={j.get('ip_forward')}")
+
+    # start with bogus ip -> validation error JSON
+    r, j = c.post("/api/mitm/wizard/start", {"target": "not-an-ip"})
+    record(r.status_code == 400 and j.get("success") is False, "MITM wizard rejects bad input")
+
+    # start against the gateway must be refused by the safety guard (or fail safely pre-root)
+    _, stats = c.get("/api/stats")
+    gw = stats.get("gateway", "")
+    if gw and "." in gw:
+        _, j = c.post("/api/mitm/wizard/start", {"target": gw})
+        msg = str(j.get("message", j.get("error", "")))
+        record(j.get("success") is False and ("Refusing" in msg or "forward" in msg.lower()
+                                              or "root" in msg.lower() or "scapy" in msg.lower()
+                                              or "MAC" in msg),
+               "MITM wizard refuses/fails safely on gateway", msg[:80])
+        c.post("/api/mitm/wizard/stop", {})
+
+    # start against a random private ip: sandbox has no root -> must fail gracefully
+    r, j = c.post("/api/mitm/wizard/start", {"target": "10.77.66.55"})
+    record("success" in j and "message" in j, "MITM wizard start graceful (lab host only)",
+           f"success={j.get('success')}")
+    c.post("/api/mitm/wizard/stop", {})
+    _, j = c.post("/api/mitm/wizard/stop", {})
+    record(j.get("success") is True, "MITM wizard stop idempotent")
 
 
 def flow_intel_endpoints(c: Client, target: str, networked: bool):

